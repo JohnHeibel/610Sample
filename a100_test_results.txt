@@ -1,0 +1,977 @@
+Are these the results I expect?
+
+
+============================================================
+  V7 Flash Attention — A100 Test Run
+  Job ID: 42441252
+  Node:   n0363
+  GPU:    NVIDIA A100 80GB PCIe
+  Date:   Sun Mar  1 12:35:54 PST 2026
+============================================================
+
+Python: Python 3.11.14
+PyTorch: 2.10.0+cu128
+CUDA:    12.8
+GPU:     NVIDIA A100 80GB PCIe
+GPU Mem: 81920 MiB
+
+=== Building CUDA extension (arch=8.0) ===
+running build_ext
+building 'attention_cuda' extension
+ninja: no work to do.
+/gpfs/packages/spack/spack-rhel8/opt/spack/linux-rhel8-broadwell/gcc-8.5.0/gcc-13.1.0-pcukou32lkbpveja3uuimh2lbpjvbu2w/bin/g++ -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/jheibel/.conda/envs/mytorch/include -fPIC -O2 -isystem /home/jheibel/.conda/envs/mytorch/include -pthread -B /home/jheibel/.conda/envs/mytorch/compiler_compat -shared /gpfs/home/jheibel/610Sample/build/temp.linux-x86_64-cpython-311/csrc/attention_ext.o /gpfs/home/jheibel/610Sample/build/temp.linux-x86_64-cpython-311/csrc/flash_double_backward_v7.o -L/home/jheibel/.conda/envs/mytorch/lib/python3.11/site-packages/torch/lib -L/packages/cuda/12.4.1/lib64 -lcublas -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-311/attention_cuda.cpython-311-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-311/attention_cuda.cpython-311-x86_64-linux-gnu.so -> 
+
+
+============================================================
+Testing dtype: bf16
+============================================================
+
+--- Forward Tests (bf16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  O: PASS (max_abs=2.20e-03, max_rel=1.43e+00)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  O: PASS (max_abs=2.45e-03, max_rel=4.30e+00)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  O: PASS (max_abs=2.06e-03, max_rel=1.85e+01)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  O: PASS (max_abs=2.87e-03, max_rel=2.56e+00)
+  B=1 H=1 N_q=64 N_kv=256 D=96 ws=192 chunk=2
+  O: PASS (max_abs=1.85e-03, max_rel=2.25e+00)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  O: PASS (max_abs=1.04e-02, max_rel=3.96e+01)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  O: PASS (max_abs=9.10e-03, max_rel=6.27e+00)
+
+--- Backward Tests (bf16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  dQ: PASS (max_abs=4.56e-03, max_rel=3.55e+01)
+  dK: PASS (max_abs=6.58e-03, max_rel=6.22e+00)
+  dV: PASS (max_abs=1.80e-03, max_rel=2.96e-03)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  dQ: PASS (max_abs=2.18e-03, max_rel=5.91e+00)
+  dK: PASS (max_abs=3.22e-03, max_rel=3.36e+01)
+  dV: PASS (max_abs=2.12e-03, max_rel=4.58e-03)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  dQ: PASS (max_abs=2.98e-03, max_rel=1.40e+02)
+  dK: PASS (max_abs=2.73e-03, max_rel=2.44e+02)
+  dV: PASS (max_abs=1.65e-03, max_rel=5.16e-03)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  dQ: PASS (max_abs=2.41e-03, max_rel=5.99e+01)
+  dK: PASS (max_abs=3.10e-03, max_rel=1.52e+02)
+  dV: PASS (max_abs=2.13e-03, max_rel=3.72e-03)
+  B=1 H=1 N_q=64 N_kv=256 D=96 ws=192 chunk=2
+  dQ: PASS (max_abs=3.61e-03, max_rel=6.22e+00)
+  dK: PASS (max_abs=3.13e-03, max_rel=1.38e+03)
+  dV: PASS (max_abs=1.74e-03, max_rel=3.42e-03)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  dQ: PASS (max_abs=4.44e-03, max_rel=3.54e+01)
+  dK: PASS (max_abs=6.93e-03, max_rel=2.59e+00)
+  dV: PASS (max_abs=1.39e-02, max_rel=4.17e-03)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  dQ: PASS (max_abs=8.03e-03, max_rel=2.57e+01)
+  dK: PASS (max_abs=1.03e-02, max_rel=1.37e+01)
+  dV: PASS (max_abs=1.28e-02, max_rel=4.48e-03)
+
+--- Double Backward Tests (bf16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  g2_Q: PASS (max_abs=7.40e-03, max_rel=7.48e+00)
+  g2_K: PASS (max_abs=1.01e-02, max_rel=4.00e+03)
+  g2_V: PASS (max_abs=3.13e-03, max_rel=1.32e-01)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  g2_Q: PASS (max_abs=9.05e-03, max_rel=5.68e+00)
+  g2_K: PASS (max_abs=8.91e-03, max_rel=2.21e+02)
+  g2_V: PASS (max_abs=2.31e-03, max_rel=5.21e-01)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  g2_Q: PASS (max_abs=8.26e-03, max_rel=8.74e+01)
+  g2_K: PASS (max_abs=8.47e-03, max_rel=1.24e+03)
+  g2_V: PASS (max_abs=2.46e-03, max_rel=3.71e+00)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  g2_Q: PASS (max_abs=7.20e-03, max_rel=1.14e+01)
+  g2_K: PASS (max_abs=1.09e-02, max_rel=4.93e+01)
+  g2_V: PASS (max_abs=2.79e-03, max_rel=2.71e-01)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  g2_Q: PASS (max_abs=1.18e-02, max_rel=1.34e+01)
+  g2_K: PASS (max_abs=2.42e-02, max_rel=5.33e+00)
+  g2_V: PASS (max_abs=7.40e-03, max_rel=7.07e-02)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  g2_Q: PASS (max_abs=1.38e-02, max_rel=2.83e+00)
+  g2_K: PASS (max_abs=2.33e-02, max_rel=3.72e+00)
+  g2_V: PASS (max_abs=3.96e-03, max_rel=1.36e-01)
+
+============================================================
+Testing dtype: fp16
+============================================================
+
+--- Forward Tests (fp16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  O: PASS (max_abs=3.22e-04, max_rel=2.17e-01)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  O: PASS (max_abs=3.59e-04, max_rel=1.08e+00)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  O: PASS (max_abs=3.65e-04, max_rel=2.91e+01)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  O: PASS (max_abs=2.06e-04, max_rel=3.79e-01)
+  B=1 H=1 N_q=64 N_kv=256 D=96 ws=192 chunk=2
+  O: PASS (max_abs=2.48e-04, max_rel=8.94e-01)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  O: PASS (max_abs=7.46e-04, max_rel=7.83e-01)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  O: PASS (max_abs=1.48e-03, max_rel=8.39e-01)
+
+--- Backward Tests (fp16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  dQ: PASS (max_abs=5.01e-04, max_rel=1.02e-01)
+  dK: PASS (max_abs=6.95e-04, max_rel=9.46e-01)
+  dV: PASS (max_abs=2.86e-04, max_rel=5.84e-04)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  dQ: PASS (max_abs=3.34e-04, max_rel=1.64e+00)
+  dK: PASS (max_abs=2.99e-04, max_rel=2.53e+01)
+  dV: PASS (max_abs=2.39e-04, max_rel=5.05e-04)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  dQ: PASS (max_abs=3.69e-04, max_rel=3.13e+00)
+  dK: PASS (max_abs=3.18e-04, max_rel=3.11e+02)
+  dV: PASS (max_abs=2.34e-04, max_rel=6.45e-04)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  dQ: PASS (max_abs=3.00e-04, max_rel=4.73e-01)
+  dK: PASS (max_abs=3.79e-04, max_rel=2.15e+00)
+  dV: PASS (max_abs=4.55e-04, max_rel=4.30e-04)
+  B=1 H=1 N_q=64 N_kv=256 D=96 ws=192 chunk=2
+  dQ: PASS (max_abs=3.39e-04, max_rel=1.10e+01)
+  dK: PASS (max_abs=3.81e-04, max_rel=9.52e+01)
+  dV: PASS (max_abs=2.78e-04, max_rel=5.01e-04)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  dQ: PASS (max_abs=8.19e-04, max_rel=1.90e+00)
+  dK: PASS (max_abs=1.10e-03, max_rel=6.58e-01)
+  dV: PASS (max_abs=1.43e-03, max_rel=5.01e-04)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  dQ: PASS (max_abs=9.95e-04, max_rel=6.51e-01)
+  dK: PASS (max_abs=1.09e-03, max_rel=1.59e+00)
+  dV: PASS (max_abs=2.04e-03, max_rel=5.68e-04)
+
+--- Double Backward Tests (fp16) ---
+  B=1 H=1 N_q=32 N_kv=128 D=64 ws=96 chunk=1
+  g2_Q: PASS (max_abs=9.45e-04, max_rel=4.58e-01)
+  g2_K: PASS (max_abs=1.11e-03, max_rel=3.78e+02)
+  g2_V: PASS (max_abs=2.10e-04, max_rel=5.91e-03)
+  B=1 H=2 N_q=64 N_kv=256 D=64 ws=192 chunk=2
+  g2_Q: PASS (max_abs=1.23e-03, max_rel=3.12e+00)
+  g2_K: PASS (max_abs=1.19e-03, max_rel=2.34e+01)
+  g2_V: PASS (max_abs=3.78e-04, max_rel=1.02e-01)
+  B=2 H=4 N_q=64 N_kv=256 D=64 ws=192 chunk=3
+  g2_Q: PASS (max_abs=1.07e-03, max_rel=7.53e+00)
+  g2_K: PASS (max_abs=1.37e-03, max_rel=1.98e+02)
+  g2_V: PASS (max_abs=2.17e-04, max_rel=1.00e+00)
+  B=1 H=1 N_q=64 N_kv=256 D=80 ws=192 chunk=1
+  g2_Q: PASS (max_abs=8.15e-04, max_rel=1.57e+00)
+  g2_K: PASS (max_abs=1.11e-03, max_rel=1.29e+02)
+  g2_V: PASS (max_abs=3.11e-04, max_rel=9.74e-02)
+  B=1 H=1 N_q=64 N_kv=256 D=64 ws=192 chunk=0
+  g2_Q: PASS (max_abs=2.44e-03, max_rel=2.79e+00)
+  g2_K: PASS (max_abs=4.20e-03, max_rel=3.05e+00)
+  g2_V: PASS (max_abs=1.09e-03, max_rel=1.07e-02)
+  B=1 H=2 N_q=32 N_kv=128 D=64 ws=96 chunk=0
+  g2_Q: PASS (max_abs=1.67e-03, max_rel=3.58e+01)
+  g2_K: PASS (max_abs=1.97e-03, max_rel=4.01e+00)
+  g2_V: PASS (max_abs=6.59e-04, max_rel=8.28e-02)
+
+--- Memory Scaling Test ---
+  forward memory:
+    N_q=64, N_kv=256: 80.5 KB
+    N_q=128, N_kv=512: 160.5 KB
+    N_q=256, N_kv=1024: 321.0 KB
+    ratio: 4.0x for 4x N (expect <8x if O(N)): PASS
+  backward memory:
+    N_q=64, N_kv=256: 161.0 KB
+    N_q=128, N_kv=512: 321.0 KB
+    N_q=256, N_kv=1024: 642.0 KB
+    ratio: 4.0x for 4x N (expect <8x if O(N)): PASS
+  double_backward memory:
+    N_q=64, N_kv=256: 316.0 KB
+    N_q=128, N_kv=512: 628.0 KB
+    N_q=256, N_kv=1024: 1254.0 KB
+    ratio: 4.0x for 4x N (expect <8x if O(N)): PASS
+
+============================================================
+Overall: ALL PASSED
+============================================================
+============================================================
+TTT-E2E PyTorch Tests
+============================================================
+
+=== Component Tests ===
+
+--- RMSNorm ---
+  shape: PASS (got torch.Size([16, 64]))
+  no NaN: PASS
+  variance ~1: PASS (mean_var=1.005)
+
+--- SwiGLU MLP ---
+  shape: PASS (got torch.Size([8, 32]))
+  no NaN: PASS
+  grad exists: PASS
+  grad no NaN: PASS
+
+--- RoPE ---
+  freqs shape: PASS (got torch.Size([64, 8]))
+  output shape: PASS (got torch.Size([32, 4, 16]))
+  no NaN: PASS
+  preserves norm: PASS (ratio=1.0000)
+
+--- SW Causal Mask ---
+  shape: PASS (got torch.Size([32, 64]))
+  causal: PASS (q=0 shouldn't see padded keys)
+  chunk2 shape: PASS (got torch.Size([32, 96]))
+  chunk2 has True: PASS
+
+--- SWA Forward ---
+  output shape: PASS (got torch.Size([16, 32]))
+  no NaN: PASS
+  kv_cache exists: PASS
+  kv_cache[0] shape: PASS
+  chunk_id incremented: PASS
+  prefix shape: PASS (got torch.Size([64, 32]))
+  prefix no NaN: PASS
+
+--- SWA Backward ---
+  input grad exists: PASS
+  input grad nonzero: PASS
+  wq grad exists: PASS
+
+--- Block ---
+  output shape: PASS (got torch.Size([16, 32]))
+  no NaN: PASS
+  has prime MLP: PASS
+  input grad exists: PASS
+
+--- CausalLM Forward ---
+  logits shape: PASS (got torch.Size([32, 64]))
+  no NaN: PASS
+  kv_caches count: PASS
+  chunk_id: PASS (got 2)
+
+--- Cross-Entropy Loss ---
+  scalar: PASS
+  positive: PASS
+  finite: PASS
+  masked finite: PASS
+
+=== Meta-Step Tests ===
+
+--- Pretrain Step ---
+  loss finite: PASS (loss=4.1719)
+  grad norm > 0: PASS (grad_norm=4.1408)
+
+--- Meta Step (CPU) ---
+  loss finite: PASS (loss=4.1574)
+  loss positive: PASS (loss=4.1574)
+  prefix blocks have grad: PASS (outer gradient should flow through inner loop)
+  suffix blocks have grad: PASS
+  no NaN grads: PASS
+
+--- Meta Step (CUDA) ---
+  loss finite: PASS (loss=4.1563)
+  total grad norm > 0: PASS (grad_norm=4.1690)
+  total grad norm finite: PASS (grad_norm=4.1690)
+
+=== V7 Integration Tests ===
+
+--- V7 Correctness ---
+  Config: H=1 Nq=32 Nkv=128 D=64 ws=96 cid=1
+    fwd max_diff: PASS (2.20e-03)
+    dQ max_diff: PASS (4.56e-03)
+    dK max_diff: PASS (6.58e-03)
+    dV max_diff: PASS (1.80e-03)
+  Config: H=4 Nq=64 Nkv=256 D=64 ws=192 cid=2
+    fwd max_diff: PASS (2.06e-03)
+    dQ max_diff: PASS (3.45e-03)
+    dK max_diff: PASS (2.54e-03)
+    dV max_diff: PASS (1.70e-03)
+
+--- V7 Meta Step ---
+  v7 loss finite: PASS (loss=4.1656)
+  v7 loss positive: PASS
+  v7 grad norm > 0: PASS (grad_norm=1.789445)
+  v7 grad norm finite: PASS
+  no NaN grads: PASS
+  loss matches ref: PASS (v7=4.1656 ref=4.1656 diff=0.0000)
+  grad match (29/29 params): PASS (worst: wte.weight max_diff=7.32e-04)
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+============================================================
+TTT-E2E Meta-Step Benchmark: small
+B=1, H=4, N_q=64, N_kv=256, D=64
+window_size=192, n_chunks=4
+dtype=bfloat16, warmup=2, trials=5
+============================================================
+
+  --- Forward agreement check ---
+  Forward check matmul vs v7: PASS (max_diff=6.84e-03)
+
+  [matmul] Running... 9.48 ms  |  21 MB peak
+
+  [v7] Running... 6.34 ms  |  19 MB peak
+
+  Speedup vs matmul:
+    v7: 1.49x
+
+=== Benchmarks ===
+
+--- Benchmark: med-H4 (ref) ---
+  layers=4, H=4, D=64, mini_batch=128, ws=512
+  Median time: 114.1 ms
+  Peak memory: 157 MB
+  Loss: 5.5716
+
+--- Benchmark: med-H4 (V7) ---
+  layers=4, H=4, D=64, mini_batch=128, ws=512
+  Median time: 108.8 ms
+  Peak memory: 134 MB
+  Loss: 5.6129
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  med-H4            114.1      108.8      1.05x        157        134      1.17x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: med-H8 (ref) ---
+  layers=4, H=8, D=64, mini_batch=128, ws=1024
+  Median time: 112.5 ms
+  Peak memory: 390 MB
+  Loss: 5.6451
+
+--- Benchmark: med-H8 (V7) ---
+  layers=4, H=8, D=64, mini_batch=128, ws=1024
+  Median time: 107.6 ms
+  Peak memory: 305 MB
+  Loss: 5.6094
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  med-H8            112.5      107.6      1.05x        390        305      1.28x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: med-H12 (ref) ---
+  layers=4, H=12, D=64, mini_batch=128, ws=1024
+  Median time: 113.8 ms
+  Peak memory: 701 MB
+  Loss: 5.6672
+
+--- Benchmark: med-H12 (V7) ---
+  layers=4, H=12, D=64, mini_batch=128, ws=1024
+  Median time: 108.9 ms
+  Peak memory: 576 MB
+  Loss: 5.6778
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  med-H12           113.8      108.9      1.05x        701        576      1.22x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: large-kv (ref) ---
+  layers=4, H=12, D=64, mini_batch=256, ws=2048
+  Median time: 114.2 ms
+  Peak memory: 1453 MB
+  Loss: 5.6988
+
+--- Benchmark: large-kv (V7) ---
+  layers=4, H=12, D=64, mini_batch=256, ws=2048
+  Median time: 109.0 ms
+  Peak memory: 962 MB
+  Loss: 5.7119
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  large-kv          114.2      109.0      1.05x       1453        962      1.51x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+GPU: NVIDIA A100 80GB PCIe
+PyTorch: 2.10.0+cu128
+
+========================================================================
+  sq-256: B=1 H=12 N_q=256 N_kv=256 D=64 ws=256 [bf16, square]
+  flash: causal mask | V7: full-window causal (equivalent)
+========================================================================
+
+  --- fwd ---
+     flash:      0.26 ms  |         2 MB
+        v7:      0.34 ms  |         2 MB
+             v7 is 0.78x vs flash (slower)  |  mem: 1.00x
+
+  --- fwd+bwd ---
+     flash:      0.80 ms  |         4 MB
+        v7:      0.72 ms  |         3 MB
+             v7 is 1.11x vs flash (faster)  |  mem: 0.73x
+
+========================================================================
+  sq-512: B=1 H=12 N_q=512 N_kv=512 D=64 ws=512 [bf16, square]
+  flash: causal mask | V7: full-window causal (equivalent)
+========================================================================
+
+  --- fwd ---
+     flash:      0.89 ms  |         6 MB
+        v7:      0.59 ms  |         3 MB
+             v7 is 1.52x vs flash (faster)  |  mem: 0.50x
+
+  --- fwd+bwd ---
+     flash:      1.51 ms  |         8 MB
+        v7:      1.09 ms  |         6 MB
+             v7 is 1.39x vs flash (faster)  |  mem: 0.73x
+
+========================================================================
+  sq-1024: B=1 H=12 N_q=1024 N_kv=1024 D=64 ws=1024 [bf16, square]
+  flash: causal mask | V7: full-window causal (equivalent)
+========================================================================
+
+  --- fwd ---
+     flash:      0.78 ms  |         6 MB
+        v7:      1.28 ms  |         6 MB
+             v7 is 0.61x vs flash (slower)  |  mem: 1.00x
+
+  --- fwd+bwd ---
+     flash:      1.00 ms  |        17 MB
+        v7:      2.01 ms  |        12 MB
+             v7 is 0.50x vs flash (slower)  |  mem: 0.73x
+
+========================================================================
+  sq-2048: B=1 H=12 N_q=2048 N_kv=2048 D=64 ws=2048 [bf16, square]
+  flash: causal mask | V7: full-window causal (equivalent)
+========================================================================
+
+  --- fwd ---
+     flash:      0.81 ms  |        12 MB
+        v7:      2.19 ms  |        12 MB
+             v7 is 0.37x vs flash (slower)  |  mem: 1.00x
+
+  --- fwd+bwd ---
+     flash:      1.70 ms  |        33 MB
+        v7:      4.42 ms  |        24 MB
+             v7 is 0.39x vs flash (slower)  |  mem: 0.73x
+
+========================================================================
+  sq-4096: B=1 H=12 N_q=4096 N_kv=4096 D=64 ws=4096 [bf16, square]
+  flash: causal mask | V7: full-window causal (equivalent)
+========================================================================
+
+  --- fwd ---
+     flash:      1.45 ms  |        24 MB
+        v7:      5.75 ms  |        24 MB
+             v7 is 0.25x vs flash (slower)  |  mem: 1.00x
+
+  --- fwd+bwd ---
+     flash:      2.92 ms  |        66 MB
+        v7:     12.47 ms  |        48 MB
+             v7 is 0.23x vs flash (slower)  |  mem: 0.73x
+
+========================================================================
+  Summary (vs FlashAttention-2, bfloat16)
+========================================================================
+  config     |  fwd flash     fwd v7   ratio |  f+b flash     f+b v7   ratio
+  -----------+--------------------------------+-------------------------------
+  sq-256     |       0.26       0.34   0.78x |       0.80       0.72   1.11x
+  sq-512     |       0.89       0.59   1.52x |       1.51       1.09   1.39x
+  sq-1024    |       0.78       1.28   0.61x |       1.00       2.01   0.50x
+  sq-2048    |       0.81       2.19   0.37x |       1.70       4.42   0.39x
+  sq-4096    |       1.45       5.75   0.25x |       2.92      12.47   0.23x
+  ========================================================================
+
+  ratio > 1 = V7 faster than flash, ratio < 1 = V7 slower
+GPU: NVIDIA A100 80GB PCIe
+PyTorch: 2.10.0+cu128
+
+========================================================================
+  large: B=1 H=12 N_q=512 N_kv=4096 D=64 ws=4096 [bf16, rect]
+  NOTE: flash uses no mask (rectangular), V7 uses sliding-window causal
+========================================================================
+
+  --- fwd ---
+     flash:      0.80 ms  |        17 MB
+        v7:      2.65 ms  |        14 MB
+             v7 is 0.30x vs flash (slower)  |  mem: 0.82x
+
+  --- fwd+bwd ---
+     flash:      1.73 ms  |        30 MB
+        v7:      4.57 ms  |        27 MB
+             v7 is 0.38x vs flash (slower)  |  mem: 0.91x
+GPU: NVIDIA A100 80GB PCIe
+PyTorch: 2.10.0+cu128
+
+========================================================================
+  125M: B=1 H=12 N_q=1024 N_kv=9216 D=64 ws=9216 [bf16, rect]
+  NOTE: flash uses no mask (rectangular), V7 uses sliding-window causal
+========================================================================
+
+  --- fwd ---
+     flash:      1.35 ms  |        31 MB
+        v7:      6.60 ms  |        31 MB
+             v7 is 0.20x vs flash (slower)  |  mem: 1.00x
+
+  --- fwd+bwd ---
+     flash:      2.72 ms  |        66 MB
+        v7:     12.98 ms  |        62 MB
+             v7 is 0.21x vs flash (slower)  |  mem: 0.94x
+
+=== Benchmarks ===
+
+--- Benchmark: 125M (ref) ---
+  layers=12, H=12, D=64, mini_batch=1024, ws=8192
+  Median time: 1677.0 ms
+  Peak memory: 74601 MB
+  Loss: 10.5287
+
+--- Benchmark: 125M (V7) ---
+  layers=12, H=12, D=64, mini_batch=1024, ws=8192
+  Median time: 2074.8 ms
+  Peak memory: 43119 MB
+  Loss: 10.5195
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  125M             1677.0     2074.8      0.81x      74601      43119      1.73x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 58.2 ms
+  Peak memory: 24 MB
+  Loss: 4.1729
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 54.7 ms
+  Peak memory: 23 MB
+  Loss: 4.1810
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               58.2       54.7      1.07x         24         23      1.03x
+  ======================================================================
+
+=== Attention-Only Meta-Step Benchmarks ===
+  (No model overhead — isolates V7 kernel advantage)
+
+--- Attn-Only: 125M (H=12 Nq=1024 Nkv=9216 D=64 ws=8192 chunks=8) ---
+  ref: 149.1 ms  |  8339 MB
+  V7: 167.1 ms  |  452 MB
+  Speedup: 0.89x  |  Mem save: 18.44x
+
+  Attention-only summary:
+  ======================================================================
+  Config       Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  125M            149.1      167.1      0.89x       8339        452     18.44x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 58.6 ms
+  Peak memory: 24 MB
+  Loss: 4.1705
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 55.2 ms
+  Peak memory: 23 MB
+  Loss: 4.1733
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               58.6       55.2      1.06x         24         23      1.03x
+  ======================================================================
+
+=== Max-Batch Throughput Benchmark ===
+  Given a fixed GPU memory budget, how much throughput can each method achieve?
+
+--- Max-Batch Throughput: 125M (H=12 Nq=1024 Nkv=9216 D=64 ws=8192) ---
+  Memory budget: 75000 MB
+
+  [ref] Finding max batch size... B=8
+  ref: B=8, 2229.4 ms, 66067 MB, 29396 tok/s
+
+  [V7] Finding max batch size... B=64
+  V7: B=64, 8370.0 ms, 26948 MB, 62639 tok/s
+
+  V7 batch advantage: 64x vs 8x (8.0x larger batch)
+  V7 throughput advantage: 2.13x tokens/sec
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 58.8 ms
+  Peak memory: 24 MB
+  Loss: 4.1676
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 55.6 ms
+  Peak memory: 23 MB
+  Loss: 4.1628
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               58.8       55.6      1.06x         24         23      1.03x
+  ======================================================================
+
+=== Attention-Only Meta-Step Benchmarks ===
+  (No model overhead — isolates V7 kernel advantage)
+
+--- Attn-Only: 760M (H=16 Nq=1024 Nkv=9216 D=96 ws=8192 chunks=8) ---
+  ref: 202.1 ms  |  11260 MB
+  V7: 224.4 ms  |  888 MB
+  Speedup: 0.90x  |  Mem save: 12.69x
+
+  Attention-only summary:
+  ======================================================================
+  Config       Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  760M            202.1      224.4      0.90x      11260        888     12.69x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 58.1 ms
+  Peak memory: 24 MB
+  Loss: 4.1779
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 54.3 ms
+  Peak memory: 23 MB
+  Loss: 4.1796
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               58.1       54.3      1.07x         24         23      1.03x
+  ======================================================================
+
+=== Max-Batch Throughput Benchmark ===
+  Given a fixed GPU memory budget, how much throughput can each method achieve?
+
+--- Max-Batch Throughput: 760M (H=16 Nq=1024 Nkv=9216 D=96 ws=8192) ---
+  Memory budget: 75000 MB
+
+  [ref] Finding max batch size... B=6
+  ref: B=6, 2270.5 ms, 67090 MB, 21648 tok/s
+
+  [V7] Finding max batch size... B=64
+  V7: B=64, 11086.1 ms, 53874 MB, 47292 tok/s
+
+  V7 batch advantage: 64x vs 6x (10.7x larger batch)
+  V7 throughput advantage: 2.18x tokens/sec
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 59.4 ms
+  Peak memory: 24 MB
+  Loss: 4.1655
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 56.5 ms
+  Peak memory: 23 MB
+  Loss: 4.1629
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               59.4       56.5      1.05x         24         23      1.03x
+  ======================================================================
+
+=== Attention-Only Meta-Step Benchmarks ===
+  (No model overhead — isolates V7 kernel advantage)
+
+--- Attn-Only: 3B (H=32 Nq=1024 Nkv=9216 D=80 ws=8192 chunks=8) ---
+  ref: 395.2 ms  |  22257 MB
+  V7: 284.1 ms  |  1447 MB
+  Speedup: 1.39x  |  Mem save: 15.38x
+
+  Attention-only summary:
+  ======================================================================
+  Config       Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  3B              395.2      284.1      1.39x      22257       1447     15.38x
+  ======================================================================
+
+============================================================
+Overall: ALL PASSED
+============================================================
+
+=== Benchmarks ===
+
+--- Benchmark: tiny (ref) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 59.3 ms
+  Peak memory: 24 MB
+  Loss: 4.1706
+
+--- Benchmark: tiny (V7) ---
+  layers=2, H=1, D=64, mini_batch=64, ws=192
+  Median time: 56.0 ms
+  Peak memory: 23 MB
+  Loss: 4.1787
+
+  Full-model meta-step summary:
+  ======================================================================
+  Config         Ref (ms)    V7 (ms)    Speedup     Ref MB      V7 MB   Mem save
+  ----------------------------------------------------------------------
+  tiny               59.3       56.0      1.06x         24         23      1.03x
+  ======================================================================
+
+=== Max-Batch Throughput Benchmark ===
+  Given a fixed GPU memory budget, how much throughput can each method achieve?
+
+--- Max-Batch Throughput: 3B (H=32 Nq=1024 Nkv=9216 D=80 ws=8192) ---
+  Memory budget: 75000 MB
+
+  [ref] Finding max batch size... B=3
+  ref: B=3, 2215.5 ms, 66580 MB, 11093 tok/s
+
+  [V7] Finding max batch size... B=51
+  V7: B=51, 13075.7 ms, 71580 MB, 31952 tok/s
+
+  V7 batch advantage: 51x vs 3x (17.0x larger batch)
+  V7 throughput advantage: 2.88x tokens/sec
+
+============================================================
+Overall: ALL PASSED
+============================================================
+GPU: NVIDIA A100 80GB PCIe
+PyTorch: 2.10.0+cu128
+
+========================================================================
+  D80: B=1 H=8 N_q=1024 N_kv=9216 D=80 ws=9216 [bf16, rect]
+  NOTE: flash uses no mask (rectangular), V7 uses sliding-window causal
+========================================================================
+
+  --- fwd ---
+     flash:      1.74 ms  |        35 MB
+        v7:      5.48 ms  |        26 MB
+             v7 is 0.32x vs flash (slower)  |  mem: 0.74x
+
+  --- fwd+bwd ---
+     flash:      2.76 ms  |        56 MB
+        v7:      9.44 ms  |        52 MB
+             v7 is 0.29x vs flash (slower)  |  mem: 0.94x
+
+======================================================================
+  V7 Kernel Correctness
+======================================================================
+
+
+  [PASSED] V7 Kernel Correctness (4.3s)
+
+======================================================================
+  E2E PyTorch Tests (skip benchmarks)
+======================================================================
+
+
+  [PASSED] E2E PyTorch Tests (skip benchmarks) (4.6s)
+
+======================================================================
+  Benchmark: small (matmul vs v7, bf16)
+======================================================================
+
+
+  [PASSED] Benchmark: small (matmul vs v7, bf16) (2.7s)
+
+======================================================================
+  E2E Full-Model Benchmark (med-H4)
+======================================================================
+
+
+  [PASSED] E2E Full-Model Benchmark (med-H4) (4.3s)
+
+======================================================================
+  E2E Full-Model Benchmark (med-H8)
+======================================================================
+
+
+  [PASSED] E2E Full-Model Benchmark (med-H8) (4.8s)
+
+======================================================================
+  E2E Full-Model Benchmark (med-H12)
+======================================================================
+
+
+  [PASSED] E2E Full-Model Benchmark (med-H12) (4.8s)
+
+======================================================================
+  E2E Full-Model Benchmark (large-kv)
+======================================================================
+
+
+  [PASSED] E2E Full-Model Benchmark (large-kv) (5.0s)
+
+======================================================================
+  V7 vs FlashAttention-2 (square configs)
+======================================================================
+
+
+  [PASSED] V7 vs FlashAttention-2 (square configs) (3.1s)
+
+======================================================================
+  V7 vs FlashAttention-2 (rectangular configs)
+======================================================================
+
+
+  [PASSED] V7 vs FlashAttention-2 (rectangular configs) (2.4s)
+
+======================================================================
+  V7 vs FlashAttention-2 (125M scale)
+======================================================================
+
+
+  [PASSED] V7 vs FlashAttention-2 (125M scale) (2.6s)
+
+======================================================================
+  E2E 125M Full Meta-Step Benchmark
+======================================================================
+
+
+  [PASSED] E2E 125M Full Meta-Step Benchmark (32.7s)
+
+======================================================================
+  Attention-Only 125M Meta-Step
+======================================================================
+
+
+  [PASSED] Attention-Only 125M Meta-Step (7.8s)
+
+======================================================================
+  Max-Batch Throughput 125M
+======================================================================
+
+
+  [PASSED] Max-Batch Throughput 125M (134.5s)
+
+======================================================================
+  Attention-Only 760M Meta-Step
+======================================================================
+
+
+  [PASSED] Attention-Only 760M Meta-Step (9.2s)
+
+======================================================================
+  Max-Batch Throughput 760M
+======================================================================
+
+
+  [PASSED] Max-Batch Throughput 760M (169.0s)
+
+======================================================================
+  Attention-Only 3B Meta-Step
+======================================================================
+
+
+  [PASSED] Attention-Only 3B Meta-Step (12.5s)
+
+======================================================================
+  Max-Batch Throughput 3B
+======================================================================
+
+
+  [PASSED] Max-Batch Throughput 3B (179.8s)
+
+======================================================================
+  V7 vs FlashAttention-2 (D=80)
+======================================================================
+
+
+  [PASSED] V7 vs FlashAttention-2 (D=80) (2.7s)
+
+======================================================================
+  SUMMARY
+======================================================================
+  [PASS] V7 Correctness
+  [PASS] E2E PyTorch
+  [PASS] Bench small
+  [PASS] Bench med-H4
+  [PASS] Bench med-H8
+  [PASS] Bench med-H12
+  [PASS] Bench large-kv
+  [PASS] V7 vs Flash (sq)
+  [PASS] V7 vs Flash (rect)
+  [PASS] V7 vs Flash 125M
+  [PASS] Bench 125M
+  [PASS] AttnBench 125M
+  [PASS] Throughput 125M
+  [PASS] AttnBench 760M
+  [PASS] Throughput 760M
+  [PASS] AttnBench 3B
+  [PASS] Throughput 3B
+  [PASS] V7 vs Flash D80
+
+  Overall: ALL PASSED
+======================================================================
