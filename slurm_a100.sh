@@ -51,7 +51,9 @@ echo "CUDA:    $(python -c 'import torch; print(torch.version.cuda)')"
 echo "GPU:     $(python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null || echo 'N/A')"
 echo ""
 
-cd "$(dirname "$0")"
+# SLURM copies the script to a spool directory, so $0 won't point back
+# to your project. Use an explicit path or SLURM_SUBMIT_DIR instead.
+cd "$SLURM_SUBMIT_DIR"
 
 # --- Build ---
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
