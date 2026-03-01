@@ -54,7 +54,8 @@ echo ""
 cd "$(dirname "$0")"
 
 # --- Build ---
-echo "=== Building CUDA extension ==="
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
+echo "=== Building CUDA extension (arch=${TORCH_CUDA_ARCH_LIST}) ==="
 python setup.py build_ext --inplace
 echo ""
 

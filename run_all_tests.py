@@ -98,7 +98,24 @@ def main():
                       "--dtype", "bfloat16", "--n-trials", "10"])
             results.append((f"AttnBench {cfg}", ok))
 
+    if args.bench:
+        # V7 vs FlashAttention-2 comparison (requires sm_80+ GPU)
+        ok = run("V7 vs FlashAttention-2 (square configs)",
+                 [sys.executable, "tests/test_vs_flash_attn.py",
+                  "--square-only", "--n-trials", "10"])
+        results.append(("V7 vs Flash (sq)", ok))
+
+        ok = run("V7 vs FlashAttention-2 (rectangular configs)",
+                 [sys.executable, "tests/test_vs_flash_attn.py",
+                  "--config", "large", "--n-trials", "10"])
+        results.append(("V7 vs Flash (rect)", ok))
+
     if args.large:
+        ok = run("V7 vs FlashAttention-2 (125M scale)",
+                 [sys.executable, "tests/test_vs_flash_attn.py",
+                  "--config", "125M", "--n-trials", "10"])
+        results.append(("V7 vs Flash 125M", ok))
+
         # 125M scale — needs significant GPU memory
         ok = run("E2E 125M Full Meta-Step Benchmark",
                  [sys.executable, "e2e/tests/test_ttt_e2e_pytorch.py",
