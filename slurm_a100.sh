@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=v7_test_%j.log
 
 # ============================================================
@@ -15,17 +15,16 @@
 #   sbatch slurm_a100.sh                   # correctness only
 #   sbatch slurm_a100.sh --bench           # + medium benchmarks
 #   sbatch slurm_a100.sh --bench --large   # + 125M-scale benchmark
+#   sbatch slurm_a100.sh --a100            # full A100 suite (125M/760M/3B)
 #
 # Prerequisites:
-#   - Python 3.12+ with PyTorch 2.x + CUDA in your environment
-#   - Either: module load cuda pytorch
-#     Or:     conda/venv with torch installed
+#   - conda env with torch + numpy installed
 #
 # The script will:
 #   1. Build the CUDA extension
 #   2. Run correctness tests (fwd, bwd, dbl_bwd, memory scaling)
 #   3. Run e2e meta-step tests with numerical comparison
-#   4. Run benchmarks (if --bench or --large)
+#   4. Run benchmarks (if --bench, --large, or --a100)
 # ============================================================
 
 set -e
@@ -49,6 +48,7 @@ echo "Python: $(python --version)"
 echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA:    $(python -c 'import torch; print(torch.version.cuda)')"
 echo "GPU:     $(python -c 'import torch; print(torch.cuda.get_device_name(0))' 2>/dev/null || echo 'N/A')"
+echo "GPU Mem: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'unknown')"
 echo ""
 
 # SLURM copies the script to a spool directory, so $0 won't point back
@@ -62,5 +62,5 @@ python setup.py build_ext --inplace
 echo ""
 
 # --- Run tests ---
-# Pass through any arguments (--bench, --large, etc.)
+# Pass through any arguments (--bench, --large, --a100, etc.)
 python run_all_tests.py --skip-build "$@"
