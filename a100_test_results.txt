@@ -1,6 +1,3 @@
-Are these the results I expect?
-
-
 ============================================================
   V7 Flash Attention — A100 Test Run
   Job ID: 42441252
