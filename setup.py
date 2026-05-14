@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 # Platform-specific compiler flags
 if sys.platform == 'win32':
-    nvcc_flags = ["-allow-unsupported-compiler", "-Xcompiler", "/Zc:preprocessor"]
+    nvcc_flags = ["-allow-unsupported-compiler", "-Xcompiler", "/Zc:preprocessor", "-lineinfo"]
     cxx_flags = ["/Zc:preprocessor"]
 else:
     nvcc_flags = []
@@ -19,6 +19,7 @@ setup(
             [
                 "csrc/attention_ext.cpp",
                 "csrc/flash_double_backward_v7.cu",
+                "csrc/flash_double_backward_v8.cu",
             ],
             libraries=["cublas"],
             extra_compile_args={

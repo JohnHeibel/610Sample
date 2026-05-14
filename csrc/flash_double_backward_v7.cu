@@ -597,8 +597,8 @@ static std::vector<at::Tensor> v7_forward_impl(
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     }
 
-    auto O = at::empty({B, H, N_q, D}, opts_half);
-    auto L = at::empty({B, H, N_q}, opts_float);
+    at::Tensor O = at::empty({B, H, N_q, D}, opts_half);
+    at::Tensor L = at::empty({B, H, N_q}, opts_float);
 
     v7_flash_fwd_kernel<D_CONST, half_t><<<grid, V7_BLOCK_THREADS, smem_bytes>>>(
         reinterpret_cast<const half_t*>(Q.data_ptr()),
@@ -1075,10 +1075,10 @@ static std::vector<at::Tensor> v7_backward_impl(
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_col));
     }
 
-    auto D_vec = at::empty({B, H, N_q}, opts_float);
-    auto dQ = at::empty({B, H, N_q, D}, opts_half);
-    auto dK = at::empty({B, H, N_kv, D}, opts_half);
-    auto dV = at::empty({B, H, N_kv, D}, opts_half);
+    at::Tensor D_vec = at::empty({B, H, N_q}, opts_float);
+    at::Tensor dQ = at::empty({B, H, N_q, D}, opts_half);
+    at::Tensor dK = at::empty({B, H, N_kv, D}, opts_half);
+    at::Tensor dV = at::empty({B, H, N_kv, D}, opts_half);
 
     v7_flash_bwd_row_kernel<D_CONST, half_t><<<grid_row, V7_BLOCK_THREADS, smem_row>>>(
         reinterpret_cast<const half_t*>(Q.data_ptr()),
@@ -1767,13 +1767,13 @@ static std::vector<at::Tensor> v7_double_backward_impl(
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_B));
     }
 
-    auto D_vec = at::empty({B, H, N_q}, opts_float);
-    auto dot2  = at::empty({B, H, N_q}, opts_float);
-    auto dot3  = at::empty({B, H, N_q}, opts_float);
-    auto g_Q   = at::zeros({B, H, N_q, D}, opts_half);
-    auto g_dO  = at::zeros({B, H, N_q, D}, opts_half);
-    auto g_K   = at::zeros({B, H, N_kv, D}, opts_half);
-    auto g_V   = at::zeros({B, H, N_kv, D}, opts_half);
+    at::Tensor D_vec = at::empty({B, H, N_q}, opts_float);
+    at::Tensor dot2  = at::empty({B, H, N_q}, opts_float);
+    at::Tensor dot3  = at::empty({B, H, N_q}, opts_float);
+    at::Tensor g_Q   = at::zeros({B, H, N_q, D}, opts_half);
+    at::Tensor g_dO  = at::zeros({B, H, N_q, D}, opts_half);
+    at::Tensor g_K   = at::zeros({B, H, N_kv, D}, opts_half);
+    at::Tensor g_V   = at::zeros({B, H, N_kv, D}, opts_half);
 
     v7_kernel_A_row<D_CONST, half_t><<<grid_A, V7_BLOCK_THREADS, smem_A>>>(
         reinterpret_cast<const half_t*>(Q.data_ptr()),
