@@ -91,6 +91,36 @@ Theta(N^2 D^2 / M), same asymptotic as the fwd+bwd. If the kernel
 realizes that prediction, the dbl_bwd should be within a small constant
 factor of fwd+bwd, not the 8-10x the autograd path currently shows.
 
+### 2026-05-14 (later) -- CUDA bwd lands (commits 6a-6d)
+
+Two-kernel split bwd in CuTe (no atomics, mirrors v8's structure):
+- bwd_dQ:  outer Q, inner KV. dQ accumulator in fp32 regs across inner loop.
+- bwd_dKV: outer KV, inner Q. dV+dK accumulators in fp32 regs.
+
+Per kernel: 3 MMAs (Q.K^T, dO.V^T, dS.K or P^T.dO+dS^T.Q) + R2S of P/dS into
+sPdS for the second MMA's A operand.
+
+Wall-clock vs PyTorch reference (5070 Ti, bf16, fwd+bwd):
+- N=512  v9 0.330 ms, pytorch 0.789 ms       (2.4x)
+- N=1024 v9 0.391 ms, pytorch 2.675 ms      (6.8x)
+- N=2048 v9 0.995 ms, pytorch 10.420 ms    (10.5x)
+- N=2048 causal v9 0.738 ms, pytorch 13.247 ms (17.9x)
+
+bf16 dV error is ~1e-4 to 1e-3, dQ/dK ~1e-6 to 1e-5. All within tolerance.
+
+ncu profile (N=1024, D=64, bf16):
+- bwd_dQ:  warp occupancy 15.6%, 0.14 inst/cycle, 8.53 MB DRAM
+- bwd_dKV: warp occupancy 15.5%, 0.13 inst/cycle, 8.54 MB DRAM
+
+Low occupancy (15%) and low IPC (0.14) suggest single-stage cp.async leaves
+memory latency exposed. Multi-stage pipelining is the natural 6i target;
+deferred until dbl_bwd kernels land so we know which kernel matters most.
+
+dbl_bwd path is still through Python autograd over _reference_bwd (correct
+but slow). Wall-clock for fwd+bwd+dbl_bwd is essentially unchanged from
+the pre-CUDA-bwd state (since dbl_bwd dominates). The CUDA dbl_bwd
+kernels (6f-6h) are the next big win.
+
 ### Open: order-2 lower bound
 
 Sketch (not yet formalized):
