@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Run all V7 tests: correctness, wall clock, memory, flash comparison, and scaling.
+Run all V7/V8 tests: correctness, wall clock, memory, flash comparison, and scaling.
 
 Usage:
-  python run_all_tests.py                    # correctness only
-  python run_all_tests.py --bench            # + wallclock, memory, flash comparison
+  python run_all_tests.py                    # correctness (v7 + v8)
+  python run_all_tests.py --bench            # + wallclock, memory, flash comparison, v7-vs-v8 bench
   python run_all_tests.py --a100             # full A100 benchmark suite (+ scaling)
 """
 
@@ -68,11 +68,26 @@ def main():
              [sys.executable, "tests/test_correctness.py"] + output_args)
     results.append(("Correctness", ok))
 
+    ok = run("V8 Kernel Correctness",
+             [sys.executable, "tests/test_correctness_v8.py"] + output_args)
+    results.append(("Correctness V8", ok))
+
     # --- 2. Wall Clock Benchmarks (--bench or --a100) ---
     if args.bench:
         ok = run("Wall Clock Benchmarks",
                  [sys.executable, "tests/test_wallclock.py"] + output_args)
         results.append(("Wall Clock", ok))
+
+        # v7 vs v8 wall-clock at each standard config
+        v8_bench_configs = ["125M", "350M", "1.3B", "2.7B", "6.7B"]
+        for cfg in v8_bench_configs:
+            out_json = os.path.join(output_dir, f"v8_bench_{cfg}.json")
+            ok = run(f"V7 vs V8 Wall Clock ({cfg})",
+                     [sys.executable, "bench_v8.py",
+                      "--config", cfg,
+                      "--out", out_json,
+                      "--label", f"a100_{cfg}"])
+            results.append((f"V8 Bench {cfg}", ok))
 
     # --- 3. Memory Benchmarks (--bench or --a100) ---
     if args.bench:
