@@ -96,8 +96,40 @@ __global__ void flash_v9_fwd_kernel(
     cp_async_wait<0>();
     __syncthreads();
 
-    // 3b: compute is intentionally absent. Smem now holds Q, K, V tiles;
-    // 3c will introduce the Q.K^T MMA.
+    // ------------------------------------------------------------------------
+    // 3c: Q . K^T MMA. Result S is in registers (rS), shape (Br, Bc) split
+    // across the warps of the TiledMma. No output write; correctness is
+    // verified implicitly through O at commit 3e.
+    // ------------------------------------------------------------------------
+    constexpr int NumWarps = NumThreads / 32;
+    using TiledMma_t = TiledMma_SM80<Dtype, NumWarps>;
+    TiledMma_t tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+
+    auto rS = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Bc>>{});
+    auto rQ = thr_mma.partition_fragment_A(sQ);
+    auto rK = thr_mma.partition_fragment_B(sK);
+    clear(rS);
+
+    using SmemCopyAtom_QK = Copy_Atom<SM75_U32x4_LDSM_N, Dtype>;
+    auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtom_QK{}, tiled_mma);
+    auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtom_QK{}, tiled_mma);
+    auto smem_thr_copy_Q   = smem_tiled_copy_Q.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_K   = smem_tiled_copy_K.get_thread_slice(threadIdx.x);
+
+    auto tSsQ      = smem_thr_copy_Q.partition_S(sQ);
+    auto tSsK      = smem_thr_copy_K.partition_S(sK);
+    auto tSrQ_view = smem_thr_copy_Q.retile_D(rQ);
+    auto tSrK_view = smem_thr_copy_K.retile_D(rK);
+
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(rQ); ++k) {
+        copy(smem_tiled_copy_Q, tSsQ(_, _, k), tSrQ_view(_, _, k));
+        copy(smem_tiled_copy_K, tSsK(_, _, k), tSrK_view(_, _, k));
+        gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
+    }
+    // rS now holds Q . K^T for the (q_block, first_kv_tile) pair.
+    // No output yet; 3d adds softmax, 3e adds P.V and writes O.
 }
 
 template <typename Dtype, int Headdim, bool IsCausal>
