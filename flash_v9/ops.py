@@ -68,10 +68,26 @@ class FlashV9Backward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g_dQ, g_dK, g_dV):
         dO, Q, K, V, O, L = ctx.saved_tensors
+        D = Q.shape[-1]
 
-        # Transitional dbl_bwd: rerun _reference_bwd with grad enabled and
-        # use torch.autograd.grad to compute (g_dO, g_Q, g_K, g_V).
-        # Will be replaced with a direct _ext.double_backward call in 6h.
+        if D == 64:
+            # CUDA dbl_bwd (the novel piece).
+            if g_dQ is None: g_dQ = torch.zeros_like(Q)
+            else:            g_dQ = g_dQ.contiguous()
+            if g_dK is None: g_dK = torch.zeros_like(K)
+            else:            g_dK = g_dK.contiguous()
+            if g_dV is None: g_dV = torch.zeros_like(V)
+            else:            g_dV = g_dV.contiguous()
+            g_dO, g_Q, g_K, g_V = _ext.double_backward(
+                g_dQ, g_dK, g_dV, dO, Q, K, V, O, L,
+                ctx.is_causal, ctx.softmax_scale,
+            )
+            return g_dO, g_Q, g_K, g_V, None, None, None, None
+
+        # D != 64 (currently only D=128 is in the FA2-parity surface):
+        # CUDA dblbwd kernels don't yet support headdim != 64, so fall
+        # back to autograd-over-_reference_bwd. (Removed once the CUDA
+        # kernels grow D=128 support.)
         with torch.enable_grad():
             dO_g = dO.detach().requires_grad_(True)
             Q_g  = Q.detach().requires_grad_(True)
@@ -120,18 +136,11 @@ class FlashV9Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         Q, K, V, O, L = ctx.saved_tensors
-        if grad_output.requires_grad:
-            # create_graph=True is in effect on the outer backward call;
-            # use the autograd-trackable Python reference so dbl_bwd works.
-            dQ, dK, dV = _reference_bwd(
-                grad_output, Q, K, V, O, L,
-                ctx.is_causal, ctx.softmax_scale,
-            )
-        else:
-            # First-order only -- fast CUDA path.
-            dQ, dK, dV = FlashV9Backward.apply(
-                grad_output, Q, K, V, O, L, ctx.is_causal, ctx.softmax_scale,
-            )
+        # FlashV9Backward.apply gives both (a) the fast CUDA bwd and (b)
+        # the CUDA dbl_bwd in its .backward. Always use it.
+        dQ, dK, dV = FlashV9Backward.apply(
+            grad_output, Q, K, V, O, L, ctx.is_causal, ctx.softmax_scale,
+        )
         return dQ, dK, dV, None, None
 
 
