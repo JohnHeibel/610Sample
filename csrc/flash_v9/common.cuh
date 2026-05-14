@@ -101,6 +101,62 @@ using SmemLayoutVt = decltype(cute::composition(
     )
 ));
 
+// SmemLayoutKt: same construction as SmemLayoutVt; used wherever K is the
+// B-operand and the MMA expects its K-axis to be the second smem dim.
+template <int Bc, int Headdim, typename Element>
+using SmemLayoutKt = SmemLayoutVt<Bc, Headdim, Element>;
+
+// SmemLayoutQt: transposed view of sQ for the dK MMA's B operand
+// (dK = dS^T . Q, where Q is consumed as (Headdim, Br) for B).
+template <int Br, int Headdim, typename Element>
+using SmemLayoutQt = decltype(cute::composition(
+    SmemLayoutQ<Br, Headdim, Element>{},
+    cute::make_ordered_layout(
+        cute::make_shape(cute::Int<Headdim>{}, cute::Int<Br>{}),
+        cute::Step<cute::_2, cute::_1>{}
+    )
+));
+
+// SmemLayoutdOt: same as SmemLayoutQt (dO is the same shape as Q).
+template <int Br, int Headdim, typename Element>
+using SmemLayoutdOt = SmemLayoutQt<Br, Headdim, Element>;
+
+// ----------------------------------------------------------------------------
+// SmemLayoutPdS: smem layout for staging P and dS between MMAs in the
+// backward and double-backward kernels. Shape is (Br, Bc), swizzled the
+// same way as SmemLayoutAtomQKV but parameterised on Bc (which is the
+// inner stride for the staged tile) instead of Headdim.
+// ----------------------------------------------------------------------------
+template <int Bc, typename Element>
+using SmemLayoutAtomPdS = decltype(cute::composition(
+    cute::Swizzle<
+        GmemCopyTraits<Bc, Element>::kSwizzle,
+        GmemCopyTraits<Bc, Element>::kSwizzleBase,
+        GmemCopyTraits<Bc, Element>::kSwizzleBase
+    >{},
+    cute::Layout<
+        cute::Shape <cute::_8, cute::Int<GmemCopyTraits<Bc, Element>::kBlockKGmem>>,
+        cute::Stride<     cute::Int<GmemCopyTraits<Bc, Element>::kBlockKGmem>, cute::_1>
+    >{}
+));
+
+template <int Br, int Bc, typename Element>
+using SmemLayoutPdS = decltype(cute::tile_to_shape(
+    SmemLayoutAtomPdS<Bc, Element>{},
+    cute::make_shape(cute::Int<Br>{}, cute::Int<Bc>{})
+));
+
+// SmemLayoutPdSt: transposed view of sPdS for using P^T or dS^T as the
+// A-operand of a subsequent MMA via SM75_U16x8_LDSM_T.
+template <int Br, int Bc, typename Element>
+using SmemLayoutPdSt = decltype(cute::composition(
+    SmemLayoutPdS<Br, Bc, Element>{},
+    cute::make_ordered_layout(
+        cute::make_shape(cute::Int<Bc>{}, cute::Int<Br>{}),
+        cute::Step<cute::_2, cute::_1>{}
+    )
+));
+
 // ----------------------------------------------------------------------------
 // Gmem TiledCopy descriptor: SM80 cp.async with int4 (16B = 8 bf16) vectors.
 // Layout-of-threads is chosen so each row of the smem atom is loaded by a
@@ -415,5 +471,102 @@ struct Softmax {
         }
     }
 };
+
+// ----------------------------------------------------------------------------
+// Reusable per-tile helpers for backward and double backward.
+// ----------------------------------------------------------------------------
+
+// P = exp2(rS * scale_log2 - L_thread * scale_log2), in place.
+// rS_rc and L_thread share the per-thread row partition: kNRows = 2 * MMA_M.
+template <typename T0, typename L0, typename T1, typename L1>
+__device__ __forceinline__ void apply_lse_exp2(
+    cute::Tensor<T0, L0>& rS_rc,
+    cute::Tensor<T1, L1> const& L_thread,
+    float scale_log2
+) {
+    using namespace cute;
+    static_assert(L0::rank == 2);
+    static_assert(L1::rank == 1);
+    CUTE_STATIC_ASSERT_V(size<0>(rS_rc) == size<0>(L_thread));
+    CUTE_UNROLL
+    for (int mi = 0; mi < size<0>(rS_rc); ++mi) {
+        const float L_scaled = L_thread(mi) * scale_log2;
+        CUTE_UNROLL
+        for (int ni = 0; ni < size<1>(rS_rc); ++ni) {
+            rS_rc(mi, ni) = exp2f(rS_rc(mi, ni) * scale_log2 - L_scaled);
+        }
+    }
+}
+
+// dS = P * (dP - D_thread) * scale, in place on rdP_rc (which then holds dS).
+template <typename TP, typename LP, typename TdP, typename LdP, typename TD, typename LD>
+__device__ __forceinline__ void apply_dS(
+    cute::Tensor<TP, LP> const& rP_rc,
+    cute::Tensor<TdP, LdP>& rdP_rc,
+    cute::Tensor<TD, LD> const& D_thread,
+    float scale
+) {
+    using namespace cute;
+    static_assert(LP::rank == 2);
+    static_assert(LdP::rank == 2);
+    static_assert(LD::rank == 1);
+    CUTE_UNROLL
+    for (int mi = 0; mi < size<0>(rdP_rc); ++mi) {
+        const float Di = D_thread(mi);
+        CUTE_UNROLL
+        for (int ni = 0; ni < size<1>(rdP_rc); ++ni) {
+            rdP_rc(mi, ni) = rP_rc(mi, ni) * (rdP_rc(mi, ni) - Di) * scale;
+        }
+    }
+}
+
+// Apply causal mask to a (Br, Bc) S tile: k_idx > q_idx -> -INFINITY.
+// q_off = q_block * Br, k_off = kv_block * Bc.
+// Templated on the TiledMma so the per-thread (row, col) coords can be derived
+// from partition_C of an identity tensor (this matches the same layout the
+// forward kernel uses).
+template <int Br, int Bc, typename TiledMma, typename T, typename L>
+__device__ __forceinline__ void causal_mask_tile(
+    cute::Tensor<T, L>& rS, int q_off, int k_off, int thread_idx
+) {
+    using namespace cute;
+    auto thr_mma = TiledMma{}.get_thread_slice(thread_idx);
+    auto cS = make_identity_tensor(Shape<Int<Br>, Int<Bc>>{});
+    auto tScS = thr_mma.partition_C(cS);
+    auto tScS_rc = make_tensor(tScS.data(),
+                               convert_layout_acc_rowcol(tScS.layout()));
+    auto rS_rc   = make_tensor(rS.data(),
+                               convert_layout_acc_rowcol(rS.layout()));
+    CUTE_UNROLL
+    for (int m = 0; m < size<0>(rS_rc); ++m) {
+        const int q_idx = q_off + get<0>(tScS_rc(m, _0{}));
+        CUTE_UNROLL
+        for (int n = 0; n < size<1>(rS_rc); ++n) {
+            const int k_idx = k_off + get<1>(tScS_rc(_0{}, n));
+            if (k_idx > q_idx) rS_rc(m, n) = -INFINITY;
+        }
+    }
+}
+
+// Build per-thread L (logsumexp) and D (rowsum(dO*O)) register tensors
+// from gmem [B,H,N] strided memory. Each thread owns 2 rows of an SM80
+// 16x8 MMA tile (the standard SM80 16x8x16 C-partition).
+template <int Br, int kNRows = 2>
+__device__ __forceinline__ void load_L_D_per_thread(
+    const float* L_bh, const float* D_bh,
+    int q_block, int N, int warp_id, int lane_id,
+    float* L_out, float* D_out
+) {
+    const int row_lo = warp_id * 16 + (lane_id >> 2);
+    const int row_hi = row_lo + 8;
+    const int q_row_lo = q_block * Br + row_lo;
+    const int q_row_hi = q_block * Br + row_hi;
+    L_out[0] = (q_row_lo < N) ? L_bh[q_row_lo] : 0.f;
+    L_out[1] = (q_row_hi < N) ? L_bh[q_row_hi] : 0.f;
+    if (D_bh != nullptr) {
+        D_out[0] = (q_row_lo < N) ? D_bh[q_row_lo] : 0.f;
+        D_out[1] = (q_row_hi < N) ? D_bh[q_row_hi] : 0.f;
+    }
+}
 
 } // namespace flash_v9
