@@ -64,136 +64,147 @@ __global__ void flash_v9_fwd_kernel(
                                make_shape(N, Int<Headdim>{}),
                                make_stride(Int<Headdim>{}, _1{}));
 
-    // Tile the head slice into (Br, Headdim) Q blocks and (Bc, Headdim) K/V
-    // blocks. For 3b we load only the first K/V tile.
+    // ------------------------------------------------------------------------
+    // Build gmem tile views for Q (single block) and K/V (all blocks).
+    // ------------------------------------------------------------------------
     auto gQ_tiles = local_tile(gQ_head, Shape<Int<Br>, Int<Headdim>>{},
                                make_coord(_, _0{}));
     auto gK_tiles = local_tile(gK_head, Shape<Int<Bc>, Int<Headdim>>{},
                                make_coord(_, _0{}));
     auto gV_tiles = local_tile(gV_head, Shape<Int<Bc>, Int<Headdim>>{},
                                make_coord(_, _0{}));
-
-    auto gQ = gQ_tiles(_, _, q_block);  // (Br, Headdim)
-    auto gK = gK_tiles(_, _, 0);        // (Bc, Headdim)
-    auto gV = gV_tiles(_, _, 0);        // (Bc, Headdim)
+    auto gQ = gQ_tiles(_, _, q_block);
+    const int num_kv_tiles = size<2>(gK_tiles);
 
     GmemCopy_t gmem_copy_qkv;
     auto thr_copy = gmem_copy_qkv.get_thread_slice(threadIdx.x);
 
+    // ------------------------------------------------------------------------
+    // Load Q once (it's the same across all K/V tiles).
+    // ------------------------------------------------------------------------
     auto tQgQ = thr_copy.partition_S(gQ);
     auto tQsQ = thr_copy.partition_D(sQ);
     copy(gmem_copy_qkv, tQgQ, tQsQ);
 
-    auto tKgK = thr_copy.partition_S(gK);
-    auto tKsK = thr_copy.partition_D(sK);
-    copy(gmem_copy_qkv, tKgK, tKsK);
-
-    auto tVgV = thr_copy.partition_S(gV);
-    auto tVsV = thr_copy.partition_D(sV);
-    copy(gmem_copy_qkv, tVgV, tVsV);
-
-    cp_async_fence();
-    cp_async_wait<0>();
-    __syncthreads();
-
     // ------------------------------------------------------------------------
-    // 3c: Q . K^T MMA. Result S is in registers (rS), shape (Br, Bc) split
-    // across the warps of the TiledMma. No output write; correctness is
-    // verified implicitly through O at commit 3e.
+    // 3c/3e components reused across the K/V loop: TiledMma, smem copies.
     // ------------------------------------------------------------------------
     constexpr int NumWarps = NumThreads / 32;
     using TiledMma_t = TiledMma_SM80<Dtype, NumWarps>;
     TiledMma_t tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
 
-    auto rS = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Bc>>{});
     auto rQ = thr_mma.partition_fragment_A(sQ);
     auto rK = thr_mma.partition_fragment_B(sK);
-    clear(rS);
+    auto sVt = make_tensor(make_smem_ptr(sV_data),
+                           SmemLayoutVt<Bc, Headdim, Dtype>{});
+    auto rV = thr_mma.partition_fragment_B(sVt);
 
     using SmemCopyAtom_QK = Copy_Atom<SM75_U32x4_LDSM_N, Dtype>;
     auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtom_QK{}, tiled_mma);
     auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtom_QK{}, tiled_mma);
     auto smem_thr_copy_Q   = smem_tiled_copy_Q.get_thread_slice(threadIdx.x);
     auto smem_thr_copy_K   = smem_tiled_copy_K.get_thread_slice(threadIdx.x);
-
     auto tSsQ      = smem_thr_copy_Q.partition_S(sQ);
     auto tSsK      = smem_thr_copy_K.partition_S(sK);
     auto tSrQ_view = smem_thr_copy_Q.retile_D(rQ);
     auto tSrK_view = smem_thr_copy_K.retile_D(rK);
 
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(rQ); ++k) {
-        copy(smem_tiled_copy_Q, tSsQ(_, _, k), tSrQ_view(_, _, k));
-        copy(smem_tiled_copy_K, tSsK(_, _, k), tSrK_view(_, _, k));
-        gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
-    }
-
-    // ------------------------------------------------------------------------
-    // 3d: online softmax for the (single) K/V tile.
-    // softmax_scale_log2 = softmax_scale * log2(e) so we can use exp2f.
-    // ------------------------------------------------------------------------
-    constexpr int kNRows = 2;  // for SM80 16x16 atom, MMA_M=1 -> 2 rows / thread
-    const float softmax_scale_log2 = softmax_scale * 1.4426950408889634f;
-    Softmax<kNRows> softmax(softmax_scale_log2);
-    softmax.template max_get_scale</*Is_first=*/true>(rS);
-    softmax.template online_softmax</*Is_first=*/true>(rS);
-
-    // ------------------------------------------------------------------------
-    // 3e: P . V MMA -> rO accumulator (fp32), finalize softmax, write O+L.
-    // ------------------------------------------------------------------------
-
-    // (1) Convert rS to A-operand layout for P.V MMA and cast fp32 -> bf16.
-    Tensor tOrP_acc = make_tensor(
-        rS.data(),
-        convert_layout_acc_Aregs<TiledMma_t>(rS.layout())
-    );
-    Tensor tOrP = make_tensor_like<Dtype>(tOrP_acc);
-    convert_type_out(tOrP_acc, tOrP);
-
-    // (2) Allocate rO fp32 accumulator for P.V output (Br x Headdim per warp-tuple).
-    auto rO = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Headdim>>{});
-    clear(rO);
-
-    // (3) Smem->reg loads for V (operand B in P.V). The physical sV is
-    // (Bc, Headdim) row-major; the MMA's B operand wants (N=Headdim, K=Bc).
-    // sVt is the same bytes viewed as (Headdim, Bc); LDSM_T transpose-loads.
-    auto sVt = make_tensor(make_smem_ptr(sV_data),
-                           SmemLayoutVt<Bc, Headdim, Dtype>{});
     using SmemCopyAtom_V = Copy_Atom<SM75_U16x8_LDSM_T, Dtype>;
     auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtom_V{}, tiled_mma);
     auto smem_thr_copy_V   = smem_tiled_copy_V.get_thread_slice(threadIdx.x);
-    auto rV = thr_mma.partition_fragment_B(sVt);
-    auto tOsV       = smem_thr_copy_V.partition_S(sVt);
-    auto tOrV_view  = smem_thr_copy_V.retile_D(rV);
+    auto tOsV      = smem_thr_copy_V.partition_S(sVt);
+    auto tOrV_view = smem_thr_copy_V.retile_D(rV);
 
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tOrP); ++k) {
-        copy(smem_tiled_copy_V, tOsV(_, _, k), tOrV_view(_, _, k));
-        gemm(tiled_mma, tOrP(_, _, k), rV(_, _, k), rO);
+    // rO accumulator (fp32) lives across all K/V tiles.
+    auto rO = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Headdim>>{});
+    clear(rO);
+
+    // Softmax state lives across all K/V tiles.
+    constexpr int kNRows = 2;
+    const float softmax_scale_log2 = softmax_scale * 1.4426950408889634f;
+    Softmax<kNRows> softmax(softmax_scale_log2);
+
+    // ------------------------------------------------------------------------
+    // 3f: outer K/V tile loop.
+    // For each kv tile: cp.async K,V -> smem; Q.K^T -> rS; online softmax;
+    // P.V -> rO (accumulating).
+    // ------------------------------------------------------------------------
+    for (int kv = 0; kv < num_kv_tiles; ++kv) {
+        // Load K and V tile from gmem to smem.
+        auto gK = gK_tiles(_, _, kv);
+        auto gV = gV_tiles(_, _, kv);
+        auto tKgK = thr_copy.partition_S(gK);
+        auto tKsK = thr_copy.partition_D(sK);
+        auto tVgV = thr_copy.partition_S(gV);
+        auto tVsV = thr_copy.partition_D(sV);
+        copy(gmem_copy_qkv, tKgK, tKsK);
+        copy(gmem_copy_qkv, tVgV, tVsV);
+        cp_async_fence();
+        cp_async_wait<0>();
+        __syncthreads();
+
+        // Q . K^T MMA -> rS.
+        auto rS = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Bc>>{});
+        clear(rS);
+        CUTE_UNROLL
+        for (int k = 0; k < size<2>(rQ); ++k) {
+            copy(smem_tiled_copy_Q, tSsQ(_, _, k), tSrQ_view(_, _, k));
+            copy(smem_tiled_copy_K, tSsK(_, _, k), tSrK_view(_, _, k));
+            gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
+        }
+
+        // Online softmax + rO rescale.
+        // - First iter: initialize row_max, row_sum; no rescale.
+        // - Later iters: update row_max, compute exp(prev_max - new_max) scale,
+        //                rescale rO by scale, update row_sum.
+        if (kv == 0) {
+            softmax.template max_get_scale</*Is_first=*/true>(rS);
+            softmax.template online_softmax</*Is_first=*/true>(rS);
+        } else {
+            auto scores_scale = softmax.template max_get_scale</*Is_first=*/false>(rS);
+            softmax.rescale_o(rO, scores_scale);
+            softmax.template online_softmax</*Is_first=*/false>(rS);
+        }
+
+        // Convert rS -> tOrP (bf16/fp16 A-operand layout) for P.V MMA.
+        Tensor tOrP_acc = make_tensor(
+            rS.data(),
+            convert_layout_acc_Aregs<TiledMma_t>(rS.layout())
+        );
+        Tensor tOrP = make_tensor_like<Dtype>(tOrP_acc);
+        convert_type_out(tOrP_acc, tOrP);
+
+        // P . V MMA -> rO (accumulating).
+        CUTE_UNROLL
+        for (int k = 0; k < size<2>(tOrP); ++k) {
+            copy(smem_tiled_copy_V, tOsV(_, _, k), tOrV_view(_, _, k));
+            gemm(tiled_mma, tOrP(_, _, k), rV(_, _, k), rO);
+        }
+
+        // Sync before next iteration overwrites sK / sV.
+        __syncthreads();
     }
 
-    // (4) Finalize softmax: quad-allreduce row_sum, divide rO by sum, and
-    // overwrite softmax.row_sum with L = m + log(sum).
+    // ------------------------------------------------------------------------
+    // Epilogue: finalize softmax, write O and L. Same as in 3e.
+    // ------------------------------------------------------------------------
     auto scores_scale = softmax.finalize(/*final_scale=*/1.0f);
     softmax.rescale_o(rO, scores_scale);
 
-    // (5) Convert rO fp32 -> bf16/fp16.
     Tensor rO_out = make_tensor_like<Dtype>(rO);
     convert_type_out(rO, rO_out);
 
-    // (6) Store rO_out to smem (reuse sQ area; Q is no longer needed).
     __syncthreads();
     auto sO = make_tensor(make_smem_ptr(sQ_data), SmemQ_t{});
     using SmemCopyAtom_O = Copy_Atom<DefaultCopy, Dtype>;
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtom_O{}, tiled_mma);
     auto smem_thr_copy_O   = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
-    auto tOsO_dst    = smem_thr_copy_O.partition_D(sO);
-    auto tOrO_view   = smem_thr_copy_O.retile_S(rO_out);
+    auto tOsO_dst  = smem_thr_copy_O.partition_D(sO);
+    auto tOrO_view = smem_thr_copy_O.retile_S(rO_out);
     copy(smem_tiled_copy_O, tOrO_view, tOsO_dst);
     __syncthreads();
 
-    // (7) Store smem -> gmem with vectorized non-async copies.
     Dtype* O_bh = O_ptr + b * o_batch_stride + h * o_head_stride;
     auto gO_head = make_tensor(make_gmem_ptr(O_bh),
                                make_shape(N, Int<Headdim>{}),
@@ -210,10 +221,6 @@ __global__ void flash_v9_fwd_kernel(
     auto tOgO     = thr_copy_o.partition_D(gO);
     copy(gmem_copy_o, tOsO_src, tOgO);
 
-    // (8) Write L. After finalize(), softmax.row_sum holds L = m + log(sum)
-    // per row, replicated across 4 lanes of each quad. Each thread owns 2
-    // rows (lane_id/4 and lane_id/4 + 8 within its warp). Lane (lane_id%4==0)
-    // is responsible for writing both rows of its quad.
     const int lane_id = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
     if ((lane_id & 3) == 0) {
@@ -309,6 +316,10 @@ std::vector<torch::Tensor> flash_v9_forward_cuda(
                 "D must match across Q, K, V");
     TORCH_CHECK(Q.size(2) == K.size(2),
                 "flash_v9: fixed-seqlen only (N_q == N_kv) in v9");
+    // v9 requires N divisible by both Br=64 (Q tile size) and Bc=64 (K/V tile
+    // size). Masking for partial tiles lands in 3g.
+    TORCH_CHECK(Q.size(2) % 64 == 0,
+                "flash_v9: N must be a multiple of 64 (until 3g adds masking)");
 
     const int64_t B = Q.size(0);
     const int64_t H = Q.size(1);

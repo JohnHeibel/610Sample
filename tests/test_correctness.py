@@ -64,6 +64,40 @@ def test_forward_single_tile():
     return all_ok
 
 
+def test_forward_multi_tile():
+    """
+    Multi-tile correctness for non-causal attention.
+    N must be a multiple of 64 (Br=Bc=64). Causal masking is added in 3g.
+    """
+    device = 'cuda'
+    dtype = torch.bfloat16
+    cases = [
+        (1, 1,  128, 64),
+        (1, 4,  256, 64),
+        (1, 8,  512, 64),
+        (1, 16, 1024, 64),
+        (1, 4,  128, 128),
+        (1, 8,  256, 128),
+        (1, 16, 1024, 128),
+    ]
+    all_ok = True
+    for B, H, N, D in cases:
+        Q, K, V = make_inputs(B, H, N, D, dtype, device)
+        O_v9  = flash_v9_attention(Q, K, V, is_causal=False).float()
+        O_ref = reference_attention(Q, K, V, is_causal=False)
+        diff = (O_v9 - O_ref).abs()
+        ma = diff.max().item()
+        mr = (diff / (O_ref.abs() + 1e-8)).max().item()
+        ok = torch.allclose(O_v9, O_ref, atol=ATOL_FWD, rtol=RTOL_FWD)
+        status = "PASS" if ok else "FAIL"
+        print(f"  [multi-tile] B={B} H={H} N={N} D={D}: {status} "
+              f"(max_abs={ma:.2e}, max_rel={mr:.2e})")
+        all_ok &= ok
+    print(f"forward multi-tile: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 if __name__ == '__main__':
     test_forward_smoke()
     test_forward_single_tile()
+    test_forward_multi_tile()
