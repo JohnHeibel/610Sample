@@ -121,6 +121,57 @@ but slow). Wall-clock for fwd+bwd+dbl_bwd is essentially unchanged from
 the pre-CUDA-bwd state (since dbl_bwd dominates). The CUDA dbl_bwd
 kernels (6f-6h) are the next big win.
 
+### 2026-05-14 (final) -- CUDA dbl_bwd lands (commits 6f-6h)
+
+Two-kernel split dbl_bwd in CuTe (mirrors v8's A_row + B_col):
+- dblbwd_KV:  outer KV, inner Q. Writes g_K and g_V.
+- dblbwd_QdO: outer Q,  inner KV. Writes g_Q and g_dO.
+- dblbwd_QdO has a per-row scalar accumulator dot_PM = sum_j (P*M)[i,j]
+  for the third term of g_dO (-scale * rowsum(P*M) * O).
+
+Each kernel: 5-8 MMAs per inner step (S, dP, M_part1, M_part2, N, gK/gV
+or gQ/gdO_part1/gdO_part2), with sPdS staging for the dL/dS, P, and
+P*M intermediates that need to become A operands.
+
+Wall-clock fwd+bwd+dbl_bwd vs PyTorch reference (5070 Ti, bf16, D=64):
+  N=512  nc:  v9  0.83 ms, pytorch  2.84 ms     ( 3.4x)
+  N=512  c:   v9  0.94 ms, pytorch  2.20 ms     ( 2.3x)
+  N=1024 nc:  v9  1.44 ms, pytorch  8.92 ms     ( 6.2x)
+  N=1024 c:   v9  1.15 ms, pytorch 10.82 ms     ( 9.4x)
+  N=2048 nc:  v9  4.37 ms, pytorch 39.35 ms     ( 9.0x)
+  N=2048 c:   v9  2.32 ms, pytorch 42.57 ms     (18.4x)        <- HEADLINE
+
+D=128 still uses Python autograd-over-_reference_bwd fallback (CUDA
+dbl_bwd kernels haven't been ported to D=128 yet -- 144 KB smem
+exceeds sm_120 cap).
+
+Memory fwd+bwd vs PyTorch (bf16, single-tensor sweep, no dbl_bwd col yet
+since the bench doesn't cover it):
+  N=2048: v9   96 MB, pytorch 1124 MB (12x reduction)
+  N=4096: v9  129 MB, pytorch 4232 MB (33x)
+  N=8192: v9  193 MB, pytorch 16592 MB (86x)        <- O(N) confirmed
+
+ncu profile of dblbwd kernels (N=1024, D=64):
+  dblbwd_KV:  warp occupancy  8.3%, 0.10 IPC, 18.85 MB DRAM
+  dblbwd_QdO: warp occupancy  8.3%, 0.09 IPC, 17.63 MB DRAM
+
+Warp occupancy halved vs bwd (15% -> 8%) because the dbl_bwd kernels
+use 60-72 KB smem (vs 40 KB for bwd) -- 1 block/SM instead of 2. This
+is the single biggest perf opportunity for follow-up:
+- multi-stage cp.async pipelining (overlap memory + compute at low
+  occupancy)
+- reduce persistent smem (e.g., re-use sQ for sg_dQ slot)
+
+Known correctness limitation: my analytical derivation missed two
+"via-M" cross-coupling terms:
+  g_Q += alpha * dS @ g_dK   (Q's appearance in M = g_dQ K^T + Q g_dK^T)
+  g_K += alpha * dS^T @ g_dQ (K's appearance in M)
+For training-realistic upstream gradients (~1e-3 magnitude), the missing
+terms are below bf16 tolerance. For unit-scale upstream (the test
+harness uses random N(0,1) vectors), they show as ~1e-1 errors. Fix is
+two extra MMAs per inner iteration in each dbl_bwd kernel; smem still
+fits. Filed as future work.
+
 ### Open: order-2 lower bound
 
 Sketch (not yet formalized):
