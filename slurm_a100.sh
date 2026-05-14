@@ -57,6 +57,7 @@ echo "============================================================"
 module purge
 module load gcc/13.1.0 miniconda-t2/20230523 python3/3.11.4 cuda/12.4.1
 # source /path/to/your/venv/bin/activate
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate mytorch
 
 echo ""
