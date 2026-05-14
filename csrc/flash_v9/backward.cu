@@ -828,6 +828,17 @@ std::vector<torch::Tensor> flash_v9_backward_cuda(
     TORCH_CHECK(Q.dim() == 4, "Q, K, V, dO must be 4D [B, H, N, D]");
     TORCH_CHECK(Q.size(2) % 64 == 0, "flash_v9 bwd: N must be a multiple of 64");
 
+    // Materialize possibly-broadcast (stride 0) or non-contiguous gradient
+    // tensors. PyTorch's autograd often passes O.sum().backward() as a
+    // stride-0 view of a scalar; without this the kernel re-reads the same
+    // element and produces astronomically wrong dQ.
+    if (!dO.is_contiguous()) dO = dO.contiguous();
+    if (!Q.is_contiguous())  Q  = Q.contiguous();
+    if (!K.is_contiguous())  K  = K.contiguous();
+    if (!V.is_contiguous())  V  = V.contiguous();
+    if (!O.is_contiguous())  O  = O.contiguous();
+    if (!L.is_contiguous())  L  = L.contiguous();
+
     const int64_t B = Q.size(0);
     const int64_t H = Q.size(1);
     const int64_t N = Q.size(2);
