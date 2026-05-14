@@ -12,38 +12,29 @@ namespace flash_v9 {
 using namespace cute;
 
 // =============================================================================
-// Algorithm 2 (backward).
+// Algorithm 2 (backward) -- v8-style two-kernel split.
 //
-// Inputs:  dO[B,H,N,D], Q,K,V[B,H,N,D], O[B,H,N,D], L[B,H,N]
-// Outputs: dQ,dK,dV[B,H,N,D]
+//   bwd_preprocess   D[b,h,row] = sum_d dO * O                  per-row kernel
+//   bwd_dQ           outer Q, inner KV.  Writes dQ.             (this commit)
+//   bwd_dKV          outer KV, inner Q.  Writes dK, dV.          (commit 6c)
 //
-// Schedule: single main kernel, outer loop over kv-blocks, inner loop over
-// q-blocks. dV / dK accumulated in registers and written once per kv-block.
-// dQ accumulated via atomicAdd on a fp32 staging tensor (cast to the input
-// dtype in a separate postprocess kernel).
-//
-// Per-row scalar D_i = sum_j dO_{i,j} * O_{i,j} is computed by a small
-// preprocess kernel and stored in a [B,H,N] fp32 tensor used by the main
-// kernel.
+// No atomics; each output is exclusive to one kernel.
 //
 // References:
-//   third_party/flash-attention/hopper/mainloop_bwd_sm80.hpp
-//   FlashAttention-2 paper, Algorithm 2.
+//   third_party/flash-attention/hopper/mainloop_bwd_sm80.hpp (FA2 reference)
+//   v8: git show v8:csrc/flash_double_backward_v8.cu          (v8 proven shape)
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// Preprocess: D = rowsum(dO * O), per (b,h,row).
-// One thread per row; threads handle Headdim contiguous dot product.
+// Preprocess: D = rowsum(dO * O), per (b, h, row). One thread per row.
 // -----------------------------------------------------------------------------
 template <typename Dtype, int Headdim>
 __global__ void flash_v9_bwd_preprocess_kernel(
-    const Dtype* __restrict__ dO,   // [B,H,N,D]
-    const Dtype* __restrict__ O,    // [B,H,N,D]
-    float*       __restrict__ D,    // [B,H,N]  (fp32 output)
+    const Dtype* __restrict__ dO,
+    const Dtype* __restrict__ O,
+    float*       __restrict__ D,
     int B, int H, int N,
-    int64_t bh_stride,        // = H * N * D for [B,H,N,D] -> bh = b*H+h
-    int64_t row_stride_qkv,   // typically D
-    int64_t l_bh_stride       // = N for [B,H,N]
+    int64_t bh_stride, int64_t row_stride_qkv, int64_t l_bh_stride
 ) {
     const int bh  = blockIdx.y;
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -60,35 +51,36 @@ __global__ void flash_v9_bwd_preprocess_kernel(
 }
 
 // -----------------------------------------------------------------------------
-// Main backward kernel.
+// bwd_dQ kernel: outer Q, inner KV. Accumulates dQ in registers and writes
+// once at the end of the kernel. No atomics.
 //
-// Outer loop over kv blocks. For each kv block:
-//   (1) Load K[kv], V[kv] into smem.
-//   (2) Initialize dK_acc, dV_acc fp32 register accumulators to 0.
-//   (3) Inner loop over q blocks (covers full N for non-causal; for causal
-//       skips q-blocks above the diagonal):
-//       (a) Load Q[q], dO[q] into smem; load L[q], D[q] into per-row regs.
-//       (b) Recompute S = (Q.K^T) * scale, apply causal mask.
-//       (c) P = exp(S - L) (row-wise broadcast).
-//       (d) dV_acc += P^T . dO
-//       (e) dP = dO . V^T
-//       (f) dS = P * (dP - D) * scale
-//       (g) dK_acc += dS^T . Q
-//       (h) Compute partial dQ = dS . K and atomicAdd into dQ_fp32[q].
-//   (4) Write dK_acc, dV_acc back to gmem (one bf16 store per kv block).
+// Per inner KV step:
+//   (a) cp.async load K, V tile
+//   (b) MMA-S    rS = Q . K^T
+//   (c) causal   mask
+//   (d) P        = exp2(rS * scale_log2 - L * scale_log2)
+//   (e) MMA-dP   rdP = dO . V^T   (V loaded as sVt + LDSM_T)
+//   (f) dS       = P * (rdP - D) * scale   (overwrites rdP)
+//   (g) R2S dS   convert rdP fp32 -> bf16 fragment, store to sPdS
+//   (h) MMA-dQ   rdQ += dS . K  (A from sPdS via LDSM_N, B as sKt + LDSM_T)
+//
+// We stage dS through sPdS rather than using register-source A because the
+// dQ MMA has a different M/K orientation than the Q.K^T MMA whose C output
+// rdP is. FA2 does the same thing (mainloop_bwd_sm80.hpp lines 836-841,
+// when Mma_dKV_is_RS=false).
+//
+// Smem at D=64:  sQ + sdO + sK + sV + sPdS = 40 KB
+// Smem at D=128: sQ + sdO + sK + sV + sPdS = 72 KB
 // -----------------------------------------------------------------------------
 template <typename Dtype, int Headdim, int Br, int Bc, bool IsCausal>
-__global__ void flash_v9_bwd_kernel(
-    const Dtype* __restrict__ Q_ptr,   // [B,H,N,D]
-    const Dtype* __restrict__ K_ptr,   // [B,H,N,D]
-    const Dtype* __restrict__ V_ptr,   // [B,H,N,D]
-    const Dtype* __restrict__ O_ptr,   // [B,H,N,D]
-    const Dtype* __restrict__ dO_ptr,  // [B,H,N,D]
-    const float* __restrict__ L_ptr,   // [B,H,N]
-    const float* __restrict__ D_ptr,   // [B,H,N]
-    float*       __restrict__ dQ_ptr,  // [B,H,N,D] (fp32 staging)
-    Dtype*       __restrict__ dK_ptr,  // [B,H,N,D]
-    Dtype*       __restrict__ dV_ptr,  // [B,H,N,D]
+__global__ void flash_v9_bwd_dQ_kernel(
+    const Dtype* __restrict__ Q_ptr,
+    const Dtype* __restrict__ K_ptr,
+    const Dtype* __restrict__ V_ptr,
+    const Dtype* __restrict__ dO_ptr,
+    const float* __restrict__ L_ptr,
+    const float* __restrict__ D_ptr,
+    Dtype*       __restrict__ dQ_ptr,
     int B, int H, int N,
     int64_t qkv_b_stride, int64_t qkv_h_stride,
     int64_t l_b_stride,   int64_t l_h_stride,
@@ -96,42 +88,43 @@ __global__ void flash_v9_bwd_kernel(
 ) {
     constexpr int NumThreads = 128;
     constexpr int NumWarps   = NumThreads / 32;
+    constexpr int kNRows     = 2;
 
-    using SmemQ_t = SmemLayoutQ<Br, Headdim, Dtype>;
-    using SmemK_t = SmemLayoutK<Bc, Headdim, Dtype>;
-    using SmemV_t = SmemLayoutV<Bc, Headdim, Dtype>;
+    using SmemQ_t    = SmemLayoutQ<Br, Headdim, Dtype>;
+    using SmemdO_t   = SmemLayoutQ<Br, Headdim, Dtype>;
+    using SmemK_t    = SmemLayoutK<Bc, Headdim, Dtype>;
+    using SmemV_t    = SmemLayoutV<Bc, Headdim, Dtype>;
+    using SmemVt_t   = SmemLayoutVt<Bc, Headdim, Dtype>;
+    using SmemKt_t   = SmemLayoutKt<Bc, Headdim, Dtype>;
+    using SmemPdS_t  = SmemLayoutPdS<Br, Bc, Dtype>;
     using GmemCopy_t =
         typename GmemTiledCopyTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
 
     extern __shared__ char smem_buf[];
-    Dtype* sQ_data  = reinterpret_cast<Dtype*>(smem_buf);
-    Dtype* sK_data  = sQ_data  + cosize_v<SmemQ_t>;
-    Dtype* sV_data  = sK_data  + cosize_v<SmemK_t>;
-    Dtype* sdO_data = sV_data  + cosize_v<SmemV_t>;
+    Dtype* sQ_data   = reinterpret_cast<Dtype*>(smem_buf);
+    Dtype* sdO_data  = sQ_data   + cosize_v<SmemQ_t>;
+    Dtype* sK_data   = sdO_data  + cosize_v<SmemdO_t>;
+    Dtype* sV_data   = sK_data   + cosize_v<SmemK_t>;
+    Dtype* sPdS_data = sV_data   + cosize_v<SmemV_t>;
 
-    auto sQ  = make_tensor(make_smem_ptr(sQ_data),  SmemQ_t{});
-    auto sK  = make_tensor(make_smem_ptr(sK_data),  SmemK_t{});
-    auto sV  = make_tensor(make_smem_ptr(sV_data),  SmemV_t{});
-    auto sdO = make_tensor(make_smem_ptr(sdO_data), SmemQ_t{});  // dO has Q-shape
-
-    // sVt and sKt transposed views needed for B-operand of various MMAs.
-    auto sVt = make_tensor(make_smem_ptr(sV_data),
-                           SmemLayoutVt<Bc, Headdim, Dtype>{});
-    auto sKt = make_tensor(make_smem_ptr(sK_data),
-                           SmemLayoutVt<Bc, Headdim, Dtype>{});
+    auto sQ   = make_tensor(make_smem_ptr(sQ_data),   SmemQ_t{});
+    auto sdO  = make_tensor(make_smem_ptr(sdO_data),  SmemdO_t{});
+    auto sK   = make_tensor(make_smem_ptr(sK_data),   SmemK_t{});
+    auto sV   = make_tensor(make_smem_ptr(sV_data),   SmemV_t{});
+    auto sVt  = make_tensor(make_smem_ptr(sV_data),   SmemVt_t{});
+    auto sKt  = make_tensor(make_smem_ptr(sK_data),   SmemKt_t{});
+    auto sPdS = make_tensor(make_smem_ptr(sPdS_data), SmemPdS_t{});
 
     const int bh = blockIdx.y;
     const int b  = bh / H;
     const int h  = bh % H;
-    const int kv_block = blockIdx.x;
+    const int q_block = blockIdx.x;
 
     const Dtype* Q_bh  = Q_ptr  + b * qkv_b_stride + h * qkv_h_stride;
     const Dtype* K_bh  = K_ptr  + b * qkv_b_stride + h * qkv_h_stride;
     const Dtype* V_bh  = V_ptr  + b * qkv_b_stride + h * qkv_h_stride;
     const Dtype* dO_bh = dO_ptr + b * qkv_b_stride + h * qkv_h_stride;
-          float* dQ_bh = dQ_ptr + b * qkv_b_stride + h * qkv_h_stride;
-          Dtype* dK_bh = dK_ptr + b * qkv_b_stride + h * qkv_h_stride;
-          Dtype* dV_bh = dV_ptr + b * qkv_b_stride + h * qkv_h_stride;
+          Dtype* dQ_bh = dQ_ptr + b * qkv_b_stride + h * qkv_h_stride;
     const float* L_bh  = L_ptr  + b * l_b_stride   + h * l_h_stride;
     const float* D_bh  = D_ptr  + b * l_b_stride   + h * l_h_stride;
 
@@ -153,273 +146,199 @@ __global__ void flash_v9_bwd_kernel(
     auto gV_tiles  = local_tile(gV_head,  Shape<Int<Bc>, Int<Headdim>>{}, make_coord(_, _0{}));
     auto gdO_tiles = local_tile(gdO_head, Shape<Int<Br>, Int<Headdim>>{}, make_coord(_, _0{}));
 
-    const int num_q_blocks = size<2>(gQ_tiles);
+    auto gQ  = gQ_tiles(_, _, q_block);
+    auto gdO = gdO_tiles(_, _, q_block);
+    const int num_kv_blocks = size<2>(gK_tiles);
 
     GmemCopy_t gmem_copy_qkv;
     auto thr_copy = gmem_copy_qkv.get_thread_slice(threadIdx.x);
 
-    // -------------------------------------------------------------------------
-    // (1) Load K, V for this kv block (persists across the inner q loop).
-    // -------------------------------------------------------------------------
-    {
-        auto gK = gK_tiles(_, _, kv_block);
-        auto gV = gV_tiles(_, _, kv_block);
-        copy(gmem_copy_qkv, thr_copy.partition_S(gK), thr_copy.partition_D(sK));
-        copy(gmem_copy_qkv, thr_copy.partition_S(gV), thr_copy.partition_D(sV));
-        cp_async_fence();
-        cp_async_wait<0>();
-        __syncthreads();
-    }
+    // Load Q and dO once.
+    copy(gmem_copy_qkv, thr_copy.partition_S(gQ),  thr_copy.partition_D(sQ));
+    copy(gmem_copy_qkv, thr_copy.partition_S(gdO), thr_copy.partition_D(sdO));
 
-    // -------------------------------------------------------------------------
-    // (2) Allocate dK_acc, dV_acc fp32 register accumulators (Bc x Headdim).
-    // The TiledMma is the same as fwd but with M-dim = Bc instead of Br.
-    // -------------------------------------------------------------------------
+    // Per-thread L and D for the 2 rows this thread owns.
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    float L_arr[2], D_arr[2];
+    load_L_D_per_thread<Br>(L_bh, D_bh, q_block, N, warp_id, lane_id, L_arr, D_arr);
+    auto L_thread = make_tensor<float>(make_shape(Int<kNRows>{}));
+    auto D_thread = make_tensor<float>(make_shape(Int<kNRows>{}));
+    L_thread(0) = L_arr[0]; L_thread(1) = L_arr[1];
+    D_thread(0) = D_arr[0]; D_thread(1) = D_arr[1];
+
     using TiledMma_t = TiledMma_SM80<Dtype, NumWarps>;
     TiledMma_t tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
 
-    // dV_acc and dK_acc are (Bc, Headdim) fp32 accumulators. Treated as the
-    // C output of an MMA whose M-dim is Bc.
-    auto rdV = partition_fragment_C(tiled_mma, Shape<Int<Bc>, Int<Headdim>>{});
-    auto rdK = partition_fragment_C(tiled_mma, Shape<Int<Bc>, Int<Headdim>>{});
-    clear(rdV);
-    clear(rdK);
+    auto rQ    = thr_mma.partition_fragment_A(sQ);
+    auto rK_S  = thr_mma.partition_fragment_B(sK);    // K as B for Q.K^T MMA  (N=Bc, K=Headdim)
+    auto rdO   = thr_mma.partition_fragment_A(sdO);
+    auto rV    = thr_mma.partition_fragment_B(sV);    // V as B for dO.V^T MMA (N=Bc, K=Headdim) -- sV row-major already has the right shape
+    auto rdS   = thr_mma.partition_fragment_A(sPdS);  // dS from sPdS for dS.K MMA
+    auto rK_Q  = thr_mma.partition_fragment_B(sKt);   // K^T as B for dS.K MMA (N=Headdim, K=Bc)
 
-    // Per-thread row indices used for atomic dQ writes and L/D loads.
-    const int lane_id = threadIdx.x & 31;
-    const int warp_id = threadIdx.x >> 5;
+    using SmemCopyAtom_AK = Copy_Atom<SM75_U32x4_LDSM_N, Dtype>;
+    using SmemCopyAtom_BT = Copy_Atom<SM75_U16x8_LDSM_T, Dtype>;
 
-    // Precompute scale_log2 used for the P = exp(S * scale - L) trick.
-    const float softmax_scale_log2 = softmax_scale * 1.4426950408889634f;
+    auto smem_tiled_copy_Q   = make_tiled_copy_A(SmemCopyAtom_AK{}, tiled_mma);
+    auto smem_tiled_copy_K_S = make_tiled_copy_B(SmemCopyAtom_AK{}, tiled_mma);  // K from sK (no transpose)
+    auto smem_tiled_copy_dO  = make_tiled_copy_A(SmemCopyAtom_AK{}, tiled_mma);
+    auto smem_tiled_copy_V   = make_tiled_copy_B(SmemCopyAtom_AK{}, tiled_mma);  // V from sV (no transpose; K=Headdim)
+    auto smem_tiled_copy_dS  = make_tiled_copy_A(SmemCopyAtom_AK{}, tiled_mma);
+    auto smem_tiled_copy_K_Q = make_tiled_copy_B(SmemCopyAtom_BT{}, tiled_mma);  // K from sKt (transposed; needs LDSM_T)
 
-    // Smem copy atoms reused across the inner q loop.
-    using SmemCopyAtom_QK = Copy_Atom<SM75_U32x4_LDSM_N, Dtype>;
-    using SmemCopyAtom_VK_T = Copy_Atom<SM75_U16x8_LDSM_T, Dtype>;
-    auto smem_tiled_copy_Q  = make_tiled_copy_A(SmemCopyAtom_QK{},   tiled_mma);
-    auto smem_tiled_copy_K  = make_tiled_copy_B(SmemCopyAtom_QK{},   tiled_mma);
-    auto smem_tiled_copy_V  = make_tiled_copy_B(SmemCopyAtom_VK_T{}, tiled_mma);
-    auto smem_tiled_copy_dO = make_tiled_copy_A(SmemCopyAtom_QK{},   tiled_mma);
-    auto smem_thr_copy_Q  = smem_tiled_copy_Q.get_thread_slice(threadIdx.x);
-    auto smem_thr_copy_K  = smem_tiled_copy_K.get_thread_slice(threadIdx.x);
-    auto smem_thr_copy_V  = smem_tiled_copy_V.get_thread_slice(threadIdx.x);
-    auto smem_thr_copy_dO = smem_tiled_copy_dO.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_Q   = smem_tiled_copy_Q.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_K_S = smem_tiled_copy_K_S.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_dO  = smem_tiled_copy_dO.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_V   = smem_tiled_copy_V.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_dS  = smem_tiled_copy_dS.get_thread_slice(threadIdx.x);
+    auto smem_thr_copy_K_Q = smem_tiled_copy_K_Q.get_thread_slice(threadIdx.x);
 
-    // -------------------------------------------------------------------------
-    // (3) Inner loop over q blocks.
-    // -------------------------------------------------------------------------
-    for (int q_block = 0; q_block < num_q_blocks; ++q_block) {
-        // Causal: skip q blocks fully above the diagonal of this kv block,
-        // i.e. q < kv (kv * Bc > q * Br + Br - 1 simplifies for Br=Bc).
+    auto tSsQ        = smem_thr_copy_Q.partition_S(sQ);
+    auto tSsK        = smem_thr_copy_K_S.partition_S(sK);
+    auto tSsdO       = smem_thr_copy_dO.partition_S(sdO);
+    auto tSsV        = smem_thr_copy_V.partition_S(sV);
+    auto tSsdS_smem  = smem_thr_copy_dS.partition_S(sPdS);
+    auto tSsKt       = smem_thr_copy_K_Q.partition_S(sKt);
+
+    auto tSrQ_view    = smem_thr_copy_Q.retile_D(rQ);
+    auto tSrK_S_view  = smem_thr_copy_K_S.retile_D(rK_S);
+    auto tSrdO_view   = smem_thr_copy_dO.retile_D(rdO);
+    auto tSrV_view    = smem_thr_copy_V.retile_D(rV);
+    auto tSrdS_view   = smem_thr_copy_dS.retile_D(rdS);
+    auto tSrK_Q_view  = smem_thr_copy_K_Q.retile_D(rK_Q);
+
+    // R2S TiledCopy for staging rdP (after it becomes rdS) into sPdS.
+    using SmemCopyAtom_R2S = Copy_Atom<DefaultCopy, Dtype>;
+    auto r2s_tiled_copy_dS = make_tiled_copy_C(SmemCopyAtom_R2S{}, tiled_mma);
+    auto r2s_thr_copy_dS   = r2s_tiled_copy_dS.get_thread_slice(threadIdx.x);
+    auto tdSsPdS           = r2s_thr_copy_dS.partition_D(sPdS);
+
+    // dQ accumulator (fp32, Br x Headdim).
+    auto rdQ = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Headdim>>{});
+    clear(rdQ);
+
+    const float scale_log2 = softmax_scale * 1.4426950408889634f;
+
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
+
+    // Inner KV loop.
+    for (int kv = 0; kv < num_kv_blocks; ++kv) {
+        // Causal skip-tile: any q_idx in [q_block*Br, q_block*Br + Br) attends
+        // to k_idx in [0, q_idx]. Skip if kv*Bc > q_block*Br + (Br - 1).
         if constexpr (IsCausal) {
-            if (q_block * Br + (Br - 1) < kv_block * Bc) continue;
+            if (kv * Bc > q_block * Br + (Br - 1)) break;
         }
 
-        // (a) Load Q[q], dO[q] into smem.
+        // (a) Load K, V tile.
         {
-            auto gQ  = gQ_tiles(_, _, q_block);
-            auto gdO = gdO_tiles(_, _, q_block);
-            copy(gmem_copy_qkv, thr_copy.partition_S(gQ),  thr_copy.partition_D(sQ));
-            copy(gmem_copy_qkv, thr_copy.partition_S(gdO), thr_copy.partition_D(sdO));
+            auto gK = gK_tiles(_, _, kv);
+            auto gV = gV_tiles(_, _, kv);
+            copy(gmem_copy_qkv, thr_copy.partition_S(gK), thr_copy.partition_D(sK));
+            copy(gmem_copy_qkv, thr_copy.partition_S(gV), thr_copy.partition_D(sV));
             cp_async_fence();
             cp_async_wait<0>();
             __syncthreads();
         }
 
-        // (b) Recompute S = Q.K^T (no scale yet -- absorbed into exp2 below).
+        // (b) MMA-S: rS = Q . K^T
         auto rS = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Bc>>{});
         clear(rS);
-        {
-            auto rQ = thr_mma.partition_fragment_A(sQ);
-            auto rK = thr_mma.partition_fragment_B(sK);
-            auto tSsQ      = smem_thr_copy_Q.partition_S(sQ);
-            auto tSsK      = smem_thr_copy_K.partition_S(sK);
-            auto tSrQ_view = smem_thr_copy_Q.retile_D(rQ);
-            auto tSrK_view = smem_thr_copy_K.retile_D(rK);
-            CUTE_UNROLL
-            for (int k = 0; k < size<2>(rQ); ++k) {
-                copy(smem_tiled_copy_Q, tSsQ(_, _, k), tSrQ_view(_, _, k));
-                copy(smem_tiled_copy_K, tSsK(_, _, k), tSrK_view(_, _, k));
-                gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
-            }
+        CUTE_UNROLL
+        for (int k = 0; k < size<2>(rQ); ++k) {
+            copy(smem_tiled_copy_Q,   tSsQ(_, _, k),       tSrQ_view(_, _, k));
+            copy(smem_tiled_copy_K_S, tSsK(_, _, k),       tSrK_S_view(_, _, k));
+            gemm(tiled_mma, rQ(_, _, k), rK_S(_, _, k), rS);
         }
 
-        // Causal mask on the (Br x Bc) S tile.
+        // (c) Causal mask.
         if constexpr (IsCausal) {
-            auto cS = make_identity_tensor(Shape<Int<Br>, Int<Bc>>{});
-            auto tScS    = thr_mma.partition_C(cS);
-            auto tScS_rc = make_tensor(tScS.data(), convert_layout_acc_rowcol(tScS.layout()));
-            auto rS_rc   = make_tensor(rS.data(),   convert_layout_acc_rowcol(rS.layout()));
-            const int row_off = q_block * Br;
-            const int col_off = kv_block * Bc;
-            CUTE_UNROLL
-            for (int m = 0; m < size<0>(rS_rc); ++m) {
-                const int q_idx = row_off + get<0>(tScS_rc(m, _0{}));
-                CUTE_UNROLL
-                for (int n = 0; n < size<1>(rS_rc); ++n) {
-                    const int k_idx = col_off + get<1>(tScS_rc(_0{}, n));
-                    if (k_idx > q_idx) rS_rc(m, n) = -INFINITY;
-                }
-            }
+            causal_mask_tile<Br, Bc, TiledMma_t>(rS, q_block * Br, kv * Bc, threadIdx.x);
         }
 
-        // (c) P = exp2(S * scale_log2 - L_i * scale_log2)
-        //   = exp(S * scale - L_i)
-        // Load L[q] for the rows owned by this thread.
-        float L_thread[2];
-        {
-            const int row_lo = warp_id * 16 + (lane_id >> 2);
-            const int row_hi = row_lo + 8;
-            const int q_row_lo = q_block * Br + row_lo;
-            const int q_row_hi = q_block * Br + row_hi;
-            L_thread[0] = (q_row_lo < N) ? L_bh[q_row_lo] : 0.f;
-            L_thread[1] = (q_row_hi < N) ? L_bh[q_row_hi] : 0.f;
-        }
+        // (d) P = exp2(rS * scale_log2 - L * scale_log2). In-place on rS.
         {
             auto rS_rc = make_tensor(rS.data(), convert_layout_acc_rowcol(rS.layout()));
-            CUTE_UNROLL
-            for (int m = 0; m < size<0>(rS_rc); ++m) {
-                const float L_scaled = L_thread[m] * softmax_scale_log2;
-                CUTE_UNROLL
-                for (int n = 0; n < size<1>(rS_rc); ++n) {
-                    rS_rc(m, n) = exp2f(rS_rc(m, n) * softmax_scale_log2 - L_scaled);
-                }
-            }
+            apply_lse_exp2(rS_rc, L_thread, scale_log2);
         }
-        // rS now holds P.
 
-        // (d) dV_acc += P^T . dO
-        // For the MMA: A=P^T (Bc x Br), B=dO (Br x Headdim), C=dV (Bc x Headdim).
-        // Trick: since P is in registers (the C output of Q.K^T), we view it as
-        // operand A (after convert_layout_acc_Aregs). But for P^T we'd need a
-        // transposed view. FA's approach: store P to smem, then load smem->reg
-        // partitioned as B for the dV MMA. Or equivalently: treat the (P^T . dO)
-        // GEMM with operand-A-from-smem schedule.
-        //
-        // For simplicity, we materialize P in smem and load it back. Reuses the
-        // sQ smem region (Q is no longer needed for this q iteration after S
-        // was computed -- actually sQ is needed below for the dK accumulation,
-        // so we use the sdO smem region instead, and load dO from gmem again
-        // when needed). Hmm, sdO is also needed for dV.
-        //
-        // Cleanest: alloc separate sP smem of size (Br x Bc) bf16 = 8KB.
-        // For now, take the simple route: store P in regs, transpose via
-        // a series of shuffles. Actually, the ldmatrix patterns can do this.
-        //
-        // Punting on the perf-optimal path: serialize through a fp32 sP smem
-        // staging area (Br x Bc * 4 = 16KB). This adds 16KB to smem.
-        // (TODO 4h: register-to-register transpose to avoid sP staging.)
+        // (e) MMA-dP: rdP = dO . V^T
+        auto rdP = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Bc>>{});
+        clear(rdP);
+        CUTE_UNROLL
+        for (int k = 0; k < size<2>(rdO); ++k) {
+            copy(smem_tiled_copy_dO, tSsdO(_, _, k), tSrdO_view(_, _, k));
+            copy(smem_tiled_copy_V,  tSsV(_, _, k),  tSrV_view(_, _, k));
+            gemm(tiled_mma, rdO(_, _, k), rV(_, _, k), rdP);
+        }
 
-        // For now, do dV and dK GEMMs by partial unrolling using the rS rowcol view.
-        // We approximate the gradient computation by skipping the full PT.dO
-        // and dS^T.Q GEMMs and instead doing them via thread-local computation
-        // restricted to the per-thread (rows, cols) of rS.
-        //
-        // That is: each thread holds a (rows_per_thread x cols_per_thread)
-        // chunk of P. For dV[kv_row_in_block, d] = sum_q P[q, kv_row_in_block].dO[q, d],
-        // we need contributions across all (q, kv_row) pairs in this tile.
-        // A thread's contribution: sum over the q-rows it owns of P[q, kv]*dO[q, d]
-        // for the kv columns it owns. After atomic adds across warps for the
-        // kv-row dimension, we get dV.
-        //
-        // This is much slower than the canonical CuTe MMA approach, but it's
-        // correct and unblocks dbl_bwd. Optimize in 4h.
-        //
-        // NOTE: the canonical MMA path requires sP staging in smem. Doing that
-        // properly requires writing rS to smem, syncing, then loading back as
-        // operand A or B for the next MMA. This is the TODO referenced above.
-        //
-        // STUB: this naive approach is too slow and not actually implemented.
-        // Proper approach below uses sP smem.
+        // (f) dS = P * (dP - D) * scale. In-place on rdP.
+        {
+            auto rS_rc  = make_tensor(rS.data(),  convert_layout_acc_rowcol(rS.layout()));
+            auto rdP_rc = make_tensor(rdP.data(), convert_layout_acc_rowcol(rdP.layout()));
+            apply_dS(rS_rc, rdP_rc, D_thread, softmax_scale);
+        }
 
-        // (DEFERRED to 4b proper: sP smem staging + canonical MMAs.)
-        // For 4a we just leave dV / dK / dQ at zero (which fails correctness
-        // but verifies kernel launches without crashing).
-        (void)rS;  // silence unused warning
+        // (g) Convert rdP -> bf16 fragment, R2S to sPdS.
+        Tensor rdP_bf16 = make_tensor_like<Dtype>(rdP);
+        convert_type_out(rdP, rdP_bf16);
+        auto tdSrdS = r2s_thr_copy_dS.retile_S(rdP_bf16);
+        copy(r2s_tiled_copy_dS, tdSrdS, tdSsPdS);
+        __syncthreads();
+
+        // (h) MMA-dQ: rdQ += dS . K  (A from sPdS via LDSM_N, B from sKt via LDSM_T).
+        CUTE_UNROLL
+        for (int k = 0; k < size<2>(rdS); ++k) {
+            copy(smem_tiled_copy_dS,  tSsdS_smem(_, _, k), tSrdS_view(_, _, k));
+            copy(smem_tiled_copy_K_Q, tSsKt(_, _, k),      tSrK_Q_view(_, _, k));
+            gemm(tiled_mma, rdS(_, _, k), rK_Q(_, _, k), rdQ);
+        }
+
+        // Sync before next iter overwrites sK, sV (and sPdS).
+        __syncthreads();
     }
 
-    // -------------------------------------------------------------------------
-    // (4) Write dK_acc, dV_acc to gmem (one bf16 store per kv block).
-    // For 4a: rdV and rdK are still zero, so this writes zeros.
-    // -------------------------------------------------------------------------
-    Tensor rdV_out = make_tensor_like<Dtype>(rdV);
-    Tensor rdK_out = make_tensor_like<Dtype>(rdK);
-    convert_type_out(rdV, rdV_out);
-    convert_type_out(rdK, rdK_out);
+    // --- Epilogue: convert rdQ -> bf16, smem stage in sQ region, gmem write.
+    Tensor rdQ_out = make_tensor_like<Dtype>(rdQ);
+    convert_type_out(rdQ, rdQ_out);
 
     __syncthreads();
-    auto sdV_smem = make_tensor(make_smem_ptr(sQ_data), SmemK_t{});
-    using SmemCopyAtom_dKV = Copy_Atom<DefaultCopy, Dtype>;
-    auto smem_tiled_copy_dKV = make_tiled_copy_C(SmemCopyAtom_dKV{}, tiled_mma);
-    auto smem_thr_copy_dKV = smem_tiled_copy_dKV.get_thread_slice(threadIdx.x);
+    auto sdQ = make_tensor(make_smem_ptr(sQ_data), SmemQ_t{});  // reuse sQ region
+    using SmemCopyAtomDef = Copy_Atom<DefaultCopy, Dtype>;
+    auto smem_tiled_copy_dQ = make_tiled_copy_C(SmemCopyAtomDef{}, tiled_mma);
+    auto smem_thr_copy_dQ   = smem_tiled_copy_dQ.get_thread_slice(threadIdx.x);
 
-    {
-        auto t = smem_thr_copy_dKV.partition_D(sdV_smem);
-        auto v = smem_thr_copy_dKV.retile_S(rdV_out);
-        copy(smem_tiled_copy_dKV, v, t);
-    }
+    auto tdQsdQ_dst = smem_thr_copy_dQ.partition_D(sdQ);
+    auto tdQrdQ_view = smem_thr_copy_dQ.retile_S(rdQ_out);
+    copy(smem_tiled_copy_dQ, tdQrdQ_view, tdQsdQ_dst);
     __syncthreads();
-    {
-        auto gdV_head = make_tensor(make_gmem_ptr(dV_bh),
-                                    make_shape(N, Int<Headdim>{}),
-                                    make_stride(Int<Headdim>{}, _1{}));
-        auto gdV_tiles = local_tile(gdV_head, Shape<Int<Bc>, Int<Headdim>>{},
-                                    make_coord(_, _0{}));
-        auto gdV = gdV_tiles(_, _, kv_block);
-        using GmemTiledCopyO_t =
-            typename GmemTiledCopyOTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
-        GmemTiledCopyO_t gmem_copy_o;
-        auto thr_copy_o = gmem_copy_o.get_thread_slice(threadIdx.x);
-        copy(gmem_copy_o, thr_copy_o.partition_S(sdV_smem), thr_copy_o.partition_D(gdV));
-    }
-    __syncthreads();
-    {
-        auto t = smem_thr_copy_dKV.partition_D(sdV_smem);
-        auto v = smem_thr_copy_dKV.retile_S(rdK_out);
-        copy(smem_tiled_copy_dKV, v, t);
-    }
-    __syncthreads();
-    {
-        auto gdK_head = make_tensor(make_gmem_ptr(dK_bh),
-                                    make_shape(N, Int<Headdim>{}),
-                                    make_stride(Int<Headdim>{}, _1{}));
-        auto gdK_tiles = local_tile(gdK_head, Shape<Int<Bc>, Int<Headdim>>{},
-                                    make_coord(_, _0{}));
-        auto gdK = gdK_tiles(_, _, kv_block);
-        using GmemTiledCopyO_t =
-            typename GmemTiledCopyOTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
-        GmemTiledCopyO_t gmem_copy_o;
-        auto thr_copy_o = gmem_copy_o.get_thread_slice(threadIdx.x);
-        copy(gmem_copy_o, thr_copy_o.partition_S(sdV_smem), thr_copy_o.partition_D(gdK));
-    }
 
-    (void)dQ_bh; (void)D_bh;  // unused in 4a
-}
+    auto gdQ_head = make_tensor(make_gmem_ptr(dQ_bh),
+                                make_shape(N, Int<Headdim>{}),
+                                make_stride(Int<Headdim>{}, _1{}));
+    auto gdQ_tiles = local_tile(gdQ_head, Shape<Int<Br>, Int<Headdim>>{},
+                                make_coord(_, _0{}));
+    auto gdQ = gdQ_tiles(_, _, q_block);
 
-// -----------------------------------------------------------------------------
-// Postprocess: cast dQ from fp32 staging to the input dtype.
-// -----------------------------------------------------------------------------
-template <typename Dtype>
-__global__ void flash_v9_bwd_postprocess_kernel(
-    const float* __restrict__ dQ_fp32,
-    Dtype*       __restrict__ dQ_out,
-    int total_elems
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total_elems) {
-        dQ_out[i] = Dtype(dQ_fp32[i]);
-    }
+    using GmemTiledCopyO_t =
+        typename GmemTiledCopyOTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
+    GmemTiledCopyO_t gmem_copy_o;
+    auto thr_copy_o = gmem_copy_o.get_thread_slice(threadIdx.x);
+    copy(gmem_copy_o, thr_copy_o.partition_S(sdQ), thr_copy_o.partition_D(gdQ));
 }
 
 // -----------------------------------------------------------------------------
 // Launch helpers.
 // -----------------------------------------------------------------------------
 template <typename Dtype, int Headdim, bool IsCausal>
-static void launch_bwd(
+static void launch_bwd_dQ(
     const Dtype* Q, const Dtype* K, const Dtype* V,
-    const Dtype* O, const Dtype* dO,
+    const Dtype* dO,
     const float* L, const float* D,
-    float* dQ_fp32, Dtype* dK, Dtype* dV,
+    Dtype* dQ,
     int B, int H, int N,
     int64_t qkv_b_stride, int64_t qkv_h_stride,
     int64_t l_b_stride,   int64_t l_h_stride,
@@ -428,51 +347,51 @@ static void launch_bwd(
     constexpr int Br = 64;
     constexpr int Bc = 64;
     constexpr int kNumThreads = 128;
+    constexpr int sQ_elems   = cosize_v<SmemLayoutQ<Br, Headdim, Dtype>>;
+    constexpr int sdO_elems  = sQ_elems;
+    constexpr int sK_elems   = cosize_v<SmemLayoutK<Bc, Headdim, Dtype>>;
+    constexpr int sV_elems   = cosize_v<SmemLayoutV<Bc, Headdim, Dtype>>;
+    constexpr int sPdS_elems = cosize_v<SmemLayoutPdS<Br, Bc, Dtype>>;
+    constexpr int smem_bytes =
+        (sQ_elems + sdO_elems + sK_elems + sV_elems + sPdS_elems) * sizeof(Dtype);
 
-    // Smem: Q + K + V + dO   (sQ also reused as sdV / sdK staging at end)
-    constexpr int sQ_elems  = cosize_v<SmemLayoutQ<Br, Headdim, Dtype>>;
-    constexpr int sK_elems  = cosize_v<SmemLayoutK<Bc, Headdim, Dtype>>;
-    constexpr int sV_elems  = cosize_v<SmemLayoutV<Bc, Headdim, Dtype>>;
-    constexpr int sdO_elems = sQ_elems;
-    constexpr int smem_bytes = (sQ_elems + sK_elems + sV_elems + sdO_elems) * sizeof(Dtype);
-
-    const int num_kv_blocks = (N + Bc - 1) / Bc;
-    dim3 grid(num_kv_blocks, B * H);
+    const int num_q_blocks = (N + Br - 1) / Br;
+    dim3 grid(num_q_blocks, B * H);
     dim3 block(kNumThreads);
 
-    flash_v9_bwd_kernel<Dtype, Headdim, Br, Bc, IsCausal>
+    // Enable >48KB dynamic smem (default cap on most arches).
+    if constexpr (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(
+            flash_v9_bwd_dQ_kernel<Dtype, Headdim, Br, Bc, IsCausal>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+
+    flash_v9_bwd_dQ_kernel<Dtype, Headdim, Br, Bc, IsCausal>
         <<<grid, block, smem_bytes, stream>>>(
-            Q, K, V, O, dO, L, D, dQ_fp32, dK, dV,
+            Q, K, V, dO, L, D, dQ,
             B, H, N,
-            qkv_b_stride, qkv_h_stride,
-            l_b_stride,   l_h_stride,
+            qkv_b_stride, qkv_h_stride, l_b_stride, l_h_stride,
             softmax_scale
         );
 }
 
 template <typename Dtype>
-static void dispatch_bwd_headdim(
-    const Dtype* Q, const Dtype* K, const Dtype* V,
-    const Dtype* O, const Dtype* dO,
+static void dispatch_bwd_dQ(
+    const Dtype* Q, const Dtype* K, const Dtype* V, const Dtype* dO,
     const float* L, const float* D,
-    float* dQ_fp32, Dtype* dK, Dtype* dV,
+    Dtype* dQ,
     int B, int H, int N, int Hd,
     int64_t qkv_b_stride, int64_t qkv_h_stride,
     int64_t l_b_stride,   int64_t l_h_stride,
     bool is_causal, float softmax_scale, cudaStream_t stream
 ) {
     #define LAUNCH(HD, CAUSAL) \
-        launch_bwd<Dtype, HD, CAUSAL>( \
-            Q, K, V, O, dO, L, D, dQ_fp32, dK, dV, \
-            B, H, N, qkv_b_stride, qkv_h_stride, l_b_stride, l_h_stride, \
+        launch_bwd_dQ<Dtype, HD, CAUSAL>(Q, K, V, dO, L, D, dQ, B, H, N, \
+            qkv_b_stride, qkv_h_stride, l_b_stride, l_h_stride, \
             softmax_scale, stream)
-    if (Hd == 64) {
-        if (is_causal) LAUNCH(64, true);  else LAUNCH(64, false);
-    } else if (Hd == 128) {
-        if (is_causal) LAUNCH(128, true); else LAUNCH(128, false);
-    } else {
-        TORCH_CHECK(false, "flash_v9 bwd: headdim must be 64 or 128");
-    }
+    if (Hd == 64)        { if (is_causal) LAUNCH(64,  true); else LAUNCH(64,  false); }
+    else if (Hd == 128)  { if (is_causal) LAUNCH(128, true); else LAUNCH(128, false); }
+    else TORCH_CHECK(false, "flash_v9 bwd: headdim must be 64 or 128");
     #undef LAUNCH
 }
 
@@ -486,15 +405,12 @@ static void launch_preprocess(
     const int threads = 128;
     const int blocks_x = (N + threads - 1) / threads;
     dim3 grid(blocks_x, B * H);
-    dim3 block(threads);
     flash_v9_bwd_preprocess_kernel<Dtype, Headdim>
-        <<<grid, block, 0, stream>>>(
-            dO, O, D, B, H, N, bh_stride, row_stride_qkv, l_bh_stride
-        );
+        <<<grid, threads, 0, stream>>>(dO, O, D, B, H, N, bh_stride, row_stride_qkv, l_bh_stride);
 }
 
 template <typename Dtype>
-static void dispatch_preprocess_headdim(
+static void dispatch_preprocess(
     const Dtype* dO, const Dtype* O, float* D,
     int B, int H, int N, int Hd,
     int64_t bh_stride, int64_t row_stride_qkv, int64_t l_bh_stride,
@@ -502,7 +418,7 @@ static void dispatch_preprocess_headdim(
 ) {
     if      (Hd == 64)  launch_preprocess<Dtype, 64>(dO, O, D, B, H, N, bh_stride, row_stride_qkv, l_bh_stride, stream);
     else if (Hd == 128) launch_preprocess<Dtype, 128>(dO, O, D, B, H, N, bh_stride, row_stride_qkv, l_bh_stride, stream);
-    else TORCH_CHECK(false, "flash_v9 preprocess: headdim must be 64 or 128");
+    else TORCH_CHECK(false, "flash_v9 bwd preprocess: headdim must be 64 or 128");
 }
 
 } // namespace flash_v9
@@ -515,19 +431,17 @@ std::vector<torch::Tensor> flash_v9_backward_cuda(
 ) {
     TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda() && dO.is_cuda(),
                 "all tensors must be CUDA");
-    TORCH_CHECK(Q.dim() == 4 && K.dim() == 4 && V.dim() == 4,
-                "Q, K, V must be 4D [B, H, N, D]");
-    TORCH_CHECK(Q.size(2) % 64 == 0,
-                "flash_v9 bwd: N must be a multiple of 64");
+    TORCH_CHECK(Q.dim() == 4, "Q, K, V, dO must be 4D [B, H, N, D]");
+    TORCH_CHECK(Q.size(2) % 64 == 0, "flash_v9 bwd: N must be a multiple of 64");
 
     const int64_t B = Q.size(0);
     const int64_t H = Q.size(1);
     const int64_t N = Q.size(2);
     const int64_t D = Q.size(3);
 
-    auto dQ_fp32 = torch::zeros_like(Q, Q.options().dtype(torch::kFloat32));
-    auto dK = torch::zeros_like(K);
-    auto dV = torch::zeros_like(V);
+    auto dQ = torch::empty_like(Q);
+    auto dK = torch::zeros_like(K);   // until 6c lands
+    auto dV = torch::zeros_like(V);   // until 6c lands
     auto D_tensor = torch::empty({B, H, N}, Q.options().dtype(torch::kFloat32));
 
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -539,23 +453,14 @@ std::vector<torch::Tensor> flash_v9_backward_cuda(
         const T* V_p  = reinterpret_cast<const T*>(V.data_ptr());
         const T* O_p  = reinterpret_cast<const T*>(O.data_ptr());
         const T* dO_p = reinterpret_cast<const T*>(dO.data_ptr());
-        T* dK_p = reinterpret_cast<T*>(dK.data_ptr());
-        T* dV_p = reinterpret_cast<T*>(dV.data_ptr());
+        T* dQ_p = reinterpret_cast<T*>(dQ.data_ptr());
 
-        flash_v9::dispatch_preprocess_headdim<T>(
-            dO_p, O_p, D_tensor.data_ptr<float>(),
-            (int)B, (int)H, (int)N, (int)D,
-            Q.stride(1), Q.stride(2), N, stream
-        );
-        flash_v9::dispatch_bwd_headdim<T>(
-            Q_p, K_p, V_p, O_p, dO_p,
-            L.data_ptr<float>(), D_tensor.data_ptr<float>(),
-            dQ_fp32.data_ptr<float>(), dK_p, dV_p,
-            (int)B, (int)H, (int)N, (int)D,
-            Q.stride(0), Q.stride(1),
-            L.stride(0), L.stride(1),
-            is_causal, (float)softmax_scale, stream
-        );
+        flash_v9::dispatch_preprocess<T>(dO_p, O_p, D_tensor.data_ptr<float>(),
+            (int)B, (int)H, (int)N, (int)D, Q.stride(1), Q.stride(2), N, stream);
+        flash_v9::dispatch_bwd_dQ<T>(Q_p, K_p, V_p, dO_p,
+            L.data_ptr<float>(), D_tensor.data_ptr<float>(), dQ_p,
+            (int)B, (int)H, (int)N, (int)D, Q.stride(0), Q.stride(1),
+            L.stride(0), L.stride(1), is_causal, (float)softmax_scale, stream);
     } else if (Q.scalar_type() == torch::kHalf) {
         using T = cutlass::half_t;
         const T* Q_p  = reinterpret_cast<const T*>(Q.data_ptr());
@@ -563,46 +468,16 @@ std::vector<torch::Tensor> flash_v9_backward_cuda(
         const T* V_p  = reinterpret_cast<const T*>(V.data_ptr());
         const T* O_p  = reinterpret_cast<const T*>(O.data_ptr());
         const T* dO_p = reinterpret_cast<const T*>(dO.data_ptr());
-        T* dK_p = reinterpret_cast<T*>(dK.data_ptr());
-        T* dV_p = reinterpret_cast<T*>(dV.data_ptr());
+        T* dQ_p = reinterpret_cast<T*>(dQ.data_ptr());
 
-        flash_v9::dispatch_preprocess_headdim<T>(
-            dO_p, O_p, D_tensor.data_ptr<float>(),
-            (int)B, (int)H, (int)N, (int)D,
-            Q.stride(1), Q.stride(2), N, stream
-        );
-        flash_v9::dispatch_bwd_headdim<T>(
-            Q_p, K_p, V_p, O_p, dO_p,
-            L.data_ptr<float>(), D_tensor.data_ptr<float>(),
-            dQ_fp32.data_ptr<float>(), dK_p, dV_p,
-            (int)B, (int)H, (int)N, (int)D,
-            Q.stride(0), Q.stride(1),
-            L.stride(0), L.stride(1),
-            is_causal, (float)softmax_scale, stream
-        );
+        flash_v9::dispatch_preprocess<T>(dO_p, O_p, D_tensor.data_ptr<float>(),
+            (int)B, (int)H, (int)N, (int)D, Q.stride(1), Q.stride(2), N, stream);
+        flash_v9::dispatch_bwd_dQ<T>(Q_p, K_p, V_p, dO_p,
+            L.data_ptr<float>(), D_tensor.data_ptr<float>(), dQ_p,
+            (int)B, (int)H, (int)N, (int)D, Q.stride(0), Q.stride(1),
+            L.stride(0), L.stride(1), is_causal, (float)softmax_scale, stream);
     } else {
         TORCH_CHECK(false, "flash_v9 bwd: only bf16 and fp16 supported");
-    }
-
-    // Cast dQ_fp32 -> dQ_dtype.
-    auto dQ = torch::empty_like(Q);
-    const int total = B * H * N * D;
-    const int threads = 256;
-    const int blocks  = (total + threads - 1) / threads;
-    if (Q.scalar_type() == torch::kBFloat16) {
-        flash_v9::flash_v9_bwd_postprocess_kernel<cutlass::bfloat16_t>
-            <<<blocks, threads, 0, stream>>>(
-                dQ_fp32.data_ptr<float>(),
-                reinterpret_cast<cutlass::bfloat16_t*>(dQ.data_ptr()),
-                total
-            );
-    } else {
-        flash_v9::flash_v9_bwd_postprocess_kernel<cutlass::half_t>
-            <<<blocks, threads, 0, stream>>>(
-                dQ_fp32.data_ptr<float>(),
-                reinterpret_cast<cutlass::half_t*>(dQ.data_ptr()),
-                total
-            );
     }
 
     return {dQ, dK, dV};

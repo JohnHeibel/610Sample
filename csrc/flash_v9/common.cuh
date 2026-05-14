@@ -476,8 +476,12 @@ struct Softmax {
 // Reusable per-tile helpers for backward and double backward.
 // ----------------------------------------------------------------------------
 
-// P = exp2(rS * scale_log2 - L_thread * scale_log2), in place.
-// rS_rc and L_thread share the per-thread row partition: kNRows = 2 * MMA_M.
+// P = exp(rS * scale - L_thread), in place via exp2.
+//   exp(S*scale - L) = exp2((S*scale - L) * log2(e))
+//                    = exp2(S * scale_log2 - L * log2(e))
+// where scale_log2 = scale * log2(e). The saved L is in "scaled S" units
+// (L = logsumexp(S*scale) from the forward), so we multiply L by log2(e)
+// (not by scale_log2) when shifting into exp2 input space.
 template <typename T0, typename L0, typename T1, typename L1>
 __device__ __forceinline__ void apply_lse_exp2(
     cute::Tensor<T0, L0>& rS_rc,
@@ -488,12 +492,13 @@ __device__ __forceinline__ void apply_lse_exp2(
     static_assert(L0::rank == 2);
     static_assert(L1::rank == 1);
     CUTE_STATIC_ASSERT_V(size<0>(rS_rc) == size<0>(L_thread));
+    constexpr float kLog2E = 1.4426950408889634f;
     CUTE_UNROLL
     for (int mi = 0; mi < size<0>(rS_rc); ++mi) {
-        const float L_scaled = L_thread(mi) * scale_log2;
+        const float L_log2 = L_thread(mi) * kLog2E;
         CUTE_UNROLL
         for (int ni = 0; ni < size<1>(rS_rc); ++ni) {
-            rS_rc(mi, ni) = exp2f(rS_rc(mi, ni) * scale_log2 - L_scaled);
+            rS_rc(mi, ni) = exp2f(rS_rc(mi, ni) * scale_log2 - L_log2);
         }
     }
 }
