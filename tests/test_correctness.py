@@ -172,9 +172,60 @@ def test_forward_causal():
     return all_ok
 
 
+def test_double_backward():
+    """Double backward: HVPs through dQ/dK/dV should match autograd reference."""
+    device = 'cuda'
+    dtype = torch.bfloat16
+    cases = [
+        (1, 1, 64,  64, False),
+        (1, 4, 128, 64, False),
+        (1, 8, 256, 64, False),
+        (1, 4, 128, 128, False),
+        (1, 4, 128, 64, True),
+        (1, 8, 256, 64, True),
+    ]
+    all_ok = True
+    for B, H, N, D, causal in cases:
+        torch.manual_seed(0)
+        Qref = (torch.randn(B, H, N, D, device=device, dtype=torch.float32) * 0.1).requires_grad_(True)
+        Kref = (torch.randn(B, H, N, D, device=device, dtype=torch.float32) * 0.1).requires_grad_(True)
+        Vref = (torch.randn(B, H, N, D, device=device, dtype=torch.float32) * 0.1).requires_grad_(True)
+        Oref = reference_attention(Qref, Kref, Vref, is_causal=causal)
+        gQ_ref, gK_ref, gV_ref = torch.autograd.grad(Oref.sum(), [Qref, Kref, Vref], create_graph=True)
+        uQ = torch.randn_like(Qref); uK = torch.randn_like(Kref); uV = torch.randn_like(Vref)
+        h_ref = (gQ_ref * uQ).sum() + (gK_ref * uK).sum() + (gV_ref * uV).sum()
+        ref_g2 = torch.autograd.grad(h_ref, [Qref, Kref, Vref])
+
+        Qv = Qref.detach().to(dtype).requires_grad_(True)
+        Kv = Kref.detach().to(dtype).requires_grad_(True)
+        Vv = Vref.detach().to(dtype).requires_grad_(True)
+        Ov = flash_v9_attention(Qv, Kv, Vv, is_causal=causal)
+        gQv, gKv, gVv = torch.autograd.grad(Ov.sum(), [Qv, Kv, Vv], create_graph=True)
+        uQv, uKv, uVv = uQ.to(dtype), uK.to(dtype), uV.to(dtype)
+        h_v = (gQv * uQv).sum() + (gKv * uKv).sum() + (gVv * uVv).sum()
+        v_g2 = torch.autograd.grad(h_v, [Qv, Kv, Vv])
+
+        atol = 1.5e-2
+        rtol = 1.5e-2
+        ok = True
+        for name, vv, rr in [('g2_Q', v_g2[0], ref_g2[0]),
+                              ('g2_K', v_g2[1], ref_g2[1]),
+                              ('g2_V', v_g2[2], ref_g2[2])]:
+            diff = (vv.float() - rr).abs()
+            ma = diff.max().item()
+            ok_x = torch.allclose(vv.float(), rr, atol=atol, rtol=rtol)
+            print(f"  [dbl_bwd] B={B} H={H} N={N} D={D} causal={causal} {name}: "
+                  f"{'PASS' if ok_x else 'FAIL'} (max_abs={ma:.2e})")
+            ok &= ok_x
+        all_ok &= ok
+    print(f"double backward: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 if __name__ == '__main__':
     test_forward_smoke()
     test_forward_single_tile()
     test_forward_multi_tile()
     test_forward_causal()
     test_backward()
+    test_double_backward()

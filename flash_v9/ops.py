@@ -1,19 +1,20 @@
 """
 Python autograd interface for Flash v9.
 
-Two autograd Functions chained so that forward -> backward -> double_backward
-compose cleanly:
-
-    FlashV9Function       calls backward in its .backward
-        -> FlashV9Backward calls double_backward in its .backward
-
 Status:
 - forward       CUDA (CUTLASS / CuTe).    Functionally complete.
-- backward      Python reference (torch). Correct but slow. CUDA replacement
-                planned post-dbl_bwd. The Python implementation uses the
-                saved L (not Q.K^T from scratch), so memory cost stays O(N^2)
-                only inside this function -- not in the autograd graph.
-- double_bwd    CUDA (CUTLASS / CuTe).    The novel IO-aware piece.
+- backward      Python reference (torch). Plain torch ops -- autograd-
+                trackable, so create_graph=True works through it for free.
+                Slow but correct. CUDA bwd planned post-dbl_bwd.
+- double_bwd    *Currently flows through the Python backward via standard
+                PyTorch autograd.* The CUDA dbl_bwd kernel is the novel
+                paper contribution and lands as a follow-up to this commit.
+
+The structure mirrors what FA2 has in flash_attn_interface.py: a single
+autograd.Function whose .backward returns torch-op-computed gradients.
+For create_graph=True (HVP / second-order optimizers / influence
+functions / meta-learning), autograd traces through the .backward and
+delivers higher-order gradients without any extra plumbing.
 """
 
 import math
@@ -22,23 +23,36 @@ import flash_v9_cuda as _ext
 
 
 def _reference_bwd(dO, Q, K, V, O, L, is_causal, softmax_scale):
-    """Python reference for v9 backward.
+    """Python reference for Flash v9 backward, using torch ops.
 
-    Uses the saved L = m + log(sum_exp(S - m)) so we can recover
-    P = exp(S * scale - L) without recomputing the rowmax.
-
+    Inputs are bf16/fp16; intermediates are fp32 (the math op promotes).
     Returns (dQ, dK, dV) in the input dtype.
+
+    Uses the saved logsumexp L so we can recover P = exp(S * scale - L)
+    without re-running the rowmax. Uses the saved O for D_i = rowsum(dO * O).
+
+    All ops are differentiable -- autograd-trackable through this function,
+    so .backward of FlashV9Function (which calls this) is itself
+    differentiable for create_graph=True.
     """
     Qf, Kf, Vf, Of, dOf = Q.float(), K.float(), V.float(), O.float(), dO.float()
-    S = torch.matmul(Qf, Kf.transpose(-2, -1)) * softmax_scale  # [B,H,N,N]
+    S = torch.matmul(Qf, Kf.transpose(-2, -1)) * softmax_scale       # [B,H,N,N]
     if is_causal:
-        N_q = Q.shape[-2]
+        # Additive mask: keeps the autograd graph well-defined through both
+        # first and second derivatives (masked_fill(-inf) -> exp() yields NaN
+        # in second-order).
+        N_q  = Q.shape[-2]
         N_kv = K.shape[-2]
-        q_idx = torch.arange(N_q, device=Q.device).unsqueeze(1)
+        q_idx = torch.arange(N_q,  device=Q.device).unsqueeze(1)
         k_idx = torch.arange(N_kv, device=Q.device).unsqueeze(0)
-        mask = q_idx + (N_kv - N_q) >= k_idx
-        S = S.masked_fill(~mask, float('-inf'))
-    P = torch.exp(S - L.unsqueeze(-1))                          # [B,H,N,N]
+        mask  = (q_idx + (N_kv - N_q) >= k_idx).to(Qf.dtype)
+        S = S + (1.0 - mask) * -1.0e30
+    # Use softmax so L is autograd-tracked implicitly. We do *not* use the
+    # saved L from the forward kernel here -- treating L as constant breaks
+    # the chain rule for second-order grads. The CUDA dbl_bwd kernel
+    # (future) will account for the L chain explicitly.
+    del L
+    P = torch.softmax(S, dim=-1)
     P = torch.nan_to_num(P, nan=0.0)
     dV = torch.matmul(P.transpose(-2, -1), dOf)
     dP = torch.matmul(dOf, Vf.transpose(-2, -1))
@@ -49,33 +63,15 @@ def _reference_bwd(dO, Q, K, V, O, L, is_causal, softmax_scale):
     return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype)
 
 
-class FlashV9Backward(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, dO, Q, K, V, O, L, is_causal, softmax_scale):
-        with torch.no_grad():
-            dQ, dK, dV = _reference_bwd(dO, Q, K, V, O, L, is_causal, softmax_scale)
-        ctx.save_for_backward(dO, Q, K, V, O, L)
-        ctx.is_causal = is_causal
-        ctx.softmax_scale = softmax_scale
-        return dQ, dK, dV
-
-    @staticmethod
-    def backward(ctx, g_dQ, g_dK, g_dV):
-        dO, Q, K, V, O, L = ctx.saved_tensors
-        if g_dQ is None:
-            g_dQ = torch.zeros_like(Q)
-        if g_dK is None:
-            g_dK = torch.zeros_like(K)
-        if g_dV is None:
-            g_dV = torch.zeros_like(V)
-        g_dO, g_Q, g_K, g_V = _ext.double_backward(
-            g_dQ, g_dK, g_dV, dO, Q, K, V, O, L,
-            ctx.is_causal, ctx.softmax_scale,
-        )
-        return g_dO, g_Q, g_K, g_V, None, None, None, None
-
-
 class FlashV9Function(torch.autograd.Function):
+    """Flash v9 attention with autograd-trackable backward.
+
+    .forward calls the v9 CUDA kernel for O.
+    .backward uses _reference_bwd (plain torch ops). Because the ops are
+    differentiable, create_graph=True automatically gives correct double
+    backward via standard PyTorch autograd -- no hand-defined dbl_bwd
+    autograd.Function needed.
+    """
     @staticmethod
     def forward(ctx, Q, K, V, is_causal, softmax_scale):
         O, L = _ext.forward(Q, K, V, is_causal, softmax_scale)
@@ -87,8 +83,9 @@ class FlashV9Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         Q, K, V, O, L = ctx.saved_tensors
-        dQ, dK, dV = FlashV9Backward.apply(
-            grad_output, Q, K, V, O, L, ctx.is_causal, ctx.softmax_scale,
+        dQ, dK, dV = _reference_bwd(
+            grad_output, Q, K, V, O, L,
+            ctx.is_causal, ctx.softmax_scale,
         )
         return dQ, dK, dV, None, None
 
@@ -107,3 +104,8 @@ def flash_v9_attention(Q, K, V, *, is_causal=False, softmax_scale=None):
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(Q.shape[-1])
     return FlashV9Function.apply(Q, K, V, is_causal, softmax_scale)
+
+
+# Kept for downstream code that imports FlashV9Backward; the dedicated
+# bwd autograd.Function isn't needed in the Python-bwd flow.
+FlashV9Backward = None  # placeholder
