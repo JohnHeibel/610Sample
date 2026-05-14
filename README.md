@@ -43,7 +43,7 @@ csrc/attention_ext.cpp pybind bindings
 flash_v9/              Python autograd Functions
 tests/                 Correctness vs PyTorch reference (and FA2 fwd+bwd)
 bench/                 Wall-clock + memory benchmarks
-profile/               ncu drivers
+profiling/             ncu drivers
 paper/theory/          Algorithm + IO-complexity notes
 third_party/cutlass/   CUTLASS submodule (added in commit 2)
 ```

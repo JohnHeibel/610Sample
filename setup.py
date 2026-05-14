@@ -22,7 +22,7 @@ if os.path.isdir(cutlass_util_include):
 
 setup(
     name="flash_v9",
-    packages=find_packages(exclude=("tests", "bench", "profile", "paper", "third_party")),
+    packages=find_packages(exclude=("tests", "bench", "profiling", "paper", "third_party")),
     ext_modules=[
         CUDAExtension(
             "flash_v9_cuda",
