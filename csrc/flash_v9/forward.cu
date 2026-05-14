@@ -154,6 +154,28 @@ __global__ void flash_v9_fwd_kernel(
             gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
         }
 
+        // Causal mask: q_idx >= k_idx. Use partition_C(identity) to get
+        // per-element (row, col) coordinates within the (Br, Bc) tile.
+        if constexpr (IsCausal) {
+            auto cS = make_identity_tensor(Shape<Int<Br>, Int<Bc>>{});
+            auto tScS = thr_mma.partition_C(cS);
+            auto tScS_rc = make_tensor(tScS.data(),
+                                       convert_layout_acc_rowcol(tScS.layout()));
+            auto rS_rc   = make_tensor(rS.data(),
+                                       convert_layout_acc_rowcol(rS.layout()));
+            const int row_off = q_block * Br;
+            const int col_off = kv * Bc;
+            CUTE_UNROLL
+            for (int m = 0; m < size<0>(rS_rc); ++m) {
+                const int q_idx = row_off + get<0>(tScS_rc(m, _0{}));
+                CUTE_UNROLL
+                for (int n = 0; n < size<1>(rS_rc); ++n) {
+                    const int k_idx = col_off + get<1>(tScS_rc(_0{}, n));
+                    if (k_idx > q_idx) rS_rc(m, n) = -INFINITY;
+                }
+            }
+        }
+
         // Online softmax + rO rescale.
         // - First iter: initialize row_max, row_sum; no rescale.
         // - Later iters: update row_max, compute exp(prev_max - new_max) scale,
