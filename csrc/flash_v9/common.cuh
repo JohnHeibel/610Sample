@@ -147,4 +147,195 @@ struct SmemSize {
     static constexpr int total_bytes = (sQ_elems + sK_elems + sV_elems) * sizeof(Element);
 };
 
+// ----------------------------------------------------------------------------
+// Online softmax helpers (cribbed from flash-attention/hopper/softmax.h +
+// utils.h, simplified for our fixed-seqlen non-fp8 path).
+// ----------------------------------------------------------------------------
+
+template <typename T>
+struct MaxOp {
+    __device__ __forceinline__ T operator()(T const& x, T const& y) { return x > y ? x : y; }
+};
+template <>
+struct MaxOp<float> {
+    __device__ __forceinline__ float operator()(float const& x, float const& y) { return max(x, y); }
+};
+
+template <typename T>
+struct SumOp {
+    __device__ __forceinline__ T operator()(T const& x, T const& y) { return x + y; }
+};
+
+template <int THREADS>
+struct Allreduce {
+    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
+    template <typename T, typename Operator>
+    static __device__ __forceinline__ T run(T x, Operator& op) {
+        constexpr int OFFSET = THREADS / 2;
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+        return Allreduce<OFFSET>::run(x, op);
+    }
+};
+template <>
+struct Allreduce<2> {
+    template <typename T, typename Operator>
+    static __device__ __forceinline__ T run(T x, Operator& op) {
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+        return x;
+    }
+};
+
+// SM80: convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N)).
+template <typename Layout>
+CUTE_DEVICE auto convert_layout_acc_rowcol(Layout acc_layout) {
+    using namespace cute;
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{});
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
+                       make_layout(get<0, 0>(l), get<2>(l)));
+}
+
+// Per-thread reduction over a 2D (rows, cols) view: reduce along the col
+// dimension to produce a per-row summary.
+template <bool zero_init = true, typename T0, typename L0, typename T1, typename L1, typename Op>
+__device__ __forceinline__ void thread_reduce_(cute::Tensor<T0, L0> const& tensor,
+                                               cute::Tensor<T1, L1>& summary,
+                                               Op& op) {
+    using namespace cute;
+    static_assert(L0::rank == 2);
+    static_assert(L1::rank == 1);
+    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
+    CUTE_UNROLL
+    for (int ni = 0; ni < size<1>(tensor); ++ni) {
+        CUTE_UNROLL
+        for (int mi = 0; mi < size<0>(tensor); ++mi) {
+            summary(mi) = (zero_init && ni == 0) ? tensor(mi, ni) : op(summary(mi), tensor(mi, ni));
+        }
+    }
+}
+
+// Warp-quad allreduce: each row of an SM80 16x8 MMA tile is shared by 4
+// consecutive lanes (lanes 0..3 share one row pair, 4..7 share the next, ...).
+template <typename T0, typename L0, typename T1, typename L1, typename Op>
+__device__ __forceinline__ void quad_allreduce_(cute::Tensor<T0, L0>& dst,
+                                                cute::Tensor<T1, L1>& src,
+                                                Op& op) {
+    using namespace cute;
+    CUTE_STATIC_ASSERT_V(size(dst) == size(src));
+    CUTE_UNROLL
+    for (int i = 0; i < size(dst); ++i) { dst(i) = Allreduce<4>::run(src(i), op); }
+}
+
+template <bool zero_init = true, typename T0, typename L0, typename T1, typename L1>
+__device__ __forceinline__ void reduce_max(cute::Tensor<T0, L0> const& tensor,
+                                           cute::Tensor<T1, L1>& mx) {
+    MaxOp<float> op;
+    thread_reduce_<zero_init>(tensor, mx, op);
+    quad_allreduce_(mx, mx, op);
+}
+
+template <bool zero_init = true, bool warp_reduce = false,
+          typename T0, typename L0, typename T1, typename L1>
+__device__ __forceinline__ void reduce_sum(cute::Tensor<T0, L0> const& tensor,
+                                           cute::Tensor<T1, L1>& sm) {
+    SumOp<float> op;
+    thread_reduce_<zero_init>(tensor, sm, op);
+    if constexpr (warp_reduce) { quad_allreduce_(sm, sm, op); }
+}
+
+template <bool Check_inf = true,
+          typename T0, typename L0, typename T1, typename L1>
+__device__ __forceinline__ void scale_apply_exp2(cute::Tensor<T0, L0>& tensor,
+                                                 cute::Tensor<T1, L1> const& mx,
+                                                 float scale_log2) {
+    using namespace cute;
+    static_assert(L0::rank == 2);
+    static_assert(L1::rank == 1);
+    CUTE_STATIC_ASSERT_V(size<0>(mx) == size<0>(tensor));
+    CUTE_UNROLL
+    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+        const float max_scaled = Check_inf
+            ? (mx(mi) == -INFINITY ? 0.f : mx(mi) * scale_log2)
+            : mx(mi) * scale_log2;
+        CUTE_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni) {
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale_log2 - max_scaled);
+        }
+    }
+}
+
+// Online softmax state: per-thread running row_max and row_sum across
+// successive K/V tiles. kNRows must match size<0>(convert_layout_acc_rowcol(rS)),
+// i.e. 2 * MMA_M for SM80.
+template <int kNRows>
+struct Softmax {
+    using TensorT = decltype(cute::make_tensor<float>(cute::Shape<cute::Int<kNRows>>{}));
+    TensorT row_max, row_sum;
+    float const softmax_scale_log2;
+
+    __device__ Softmax(float scale_log2) : softmax_scale_log2(scale_log2) {}
+
+    template <bool Is_first, bool Check_inf = false, typename TensorAcc>
+    __forceinline__ __device__ TensorT max_get_scale(TensorAcc& acc_s) {
+        using namespace cute;
+        Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        TensorT scores_scale;
+        if constexpr (Is_first) {
+            reduce_max</*zero_init=*/true>(scores, row_max);
+            cute::fill(scores_scale, 1.f);
+        } else {
+            Tensor prev_max = cute::make_fragment_like(row_max);
+            cute::copy(row_max, prev_max);
+            reduce_max</*zero_init=*/false>(scores, row_max);
+            CUTE_UNROLL
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float cur = !Check_inf ? row_max(mi) : (row_max(mi) == -INFINITY ? 0.f : row_max(mi));
+                scores_scale(mi) = exp2f((prev_max(mi) - cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale(mi);
+            }
+        }
+        return scores_scale;
+    }
+
+    template <bool Is_first, bool Check_inf = false, typename TensorAcc>
+    __forceinline__ __device__ void online_softmax(TensorAcc& acc_s) {
+        using namespace cute;
+        Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+        scale_apply_exp2<Check_inf>(scores, row_max, softmax_scale_log2);
+        reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+    }
+
+    __forceinline__ __device__ TensorT finalize(float final_scale = 1.f) {
+        SumOp<float> op;
+        quad_allreduce_(row_sum, row_sum, op);
+        TensorT scores_scale;
+        CUTE_UNROLL
+        for (int mi = 0; mi < size(row_sum); ++mi) {
+            float s = row_sum(mi);
+            float inv = (s == 0.f || s != s) ? 0.f : 1.f / s;
+            scores_scale(mi) = inv * final_scale;
+            // Store logsumexp = max * ln(2) * log2(e) + log(sum) = max + log(sum)
+            // because softmax_scale_log2 already absorbs the softmax scale.
+            row_sum(mi) = (s == 0.f || s != s)
+                ? -INFINITY
+                : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(s);
+        }
+        return scores_scale;
+    }
+
+    template <typename TensorO>
+    __forceinline__ __device__ void rescale_o(TensorO& acc_o, TensorT const& scores_scale) {
+        using namespace cute;
+        Tensor acc_o_rc = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rc))::value == kNRows);
+        CUTE_UNROLL
+        for (int mi = 0; mi < size<0>(acc_o_rc); ++mi) {
+            CUTE_UNROLL
+            for (int ni = 0; ni < size<1>(acc_o_rc); ++ni) { acc_o_rc(mi, ni) *= scores_scale(mi); }
+        }
+    }
+};
+
 } // namespace flash_v9

@@ -27,7 +27,7 @@ __global__ void flash_v9_fwd_kernel(
     int64_t qkv_batch_stride, int64_t qkv_head_stride, int64_t /*qkv_row_stride*/,
     int64_t /*o_batch_stride*/, int64_t /*o_head_stride*/, int64_t /*o_row_stride*/,
     int64_t /*l_batch_stride*/, int64_t /*l_head_stride*/,
-    float /*softmax_scale*/
+    float softmax_scale
 ) {
     constexpr int NumThreads = 128;
     using SmemQ_t = SmemLayoutQ<Br, Headdim, Dtype>;
@@ -128,8 +128,20 @@ __global__ void flash_v9_fwd_kernel(
         copy(smem_tiled_copy_K, tSsK(_, _, k), tSrK_view(_, _, k));
         gemm(tiled_mma, rQ(_, _, k), rK(_, _, k), rS);
     }
-    // rS now holds Q . K^T for the (q_block, first_kv_tile) pair.
-    // No output yet; 3d adds softmax, 3e adds P.V and writes O.
+
+    // ------------------------------------------------------------------------
+    // 3d: online softmax for the (single) K/V tile.
+    // softmax_scale_log2 = softmax_scale * log2(e) so we can use exp2f.
+    // ------------------------------------------------------------------------
+    constexpr int kNRows = 2;  // for SM80 16x16 atom, MMA_M=1 -> 2 rows / thread
+    const float softmax_scale_log2 = softmax_scale * 1.4426950408889634f;
+    Softmax<kNRows> softmax(softmax_scale_log2);
+    softmax.template max_get_scale</*Is_first=*/true>(rS);
+    softmax.template online_softmax</*Is_first=*/true>(rS);
+
+    // rS now holds P = exp2((Q.K^T) * softmax_scale_log2 - max_scaled).
+    // softmax.row_sum holds the per-row partial sum (no quad allreduce yet).
+    // 3e: convert rS to bf16, do P.V MMA, write O + L.
 }
 
 template <typename Dtype, int Headdim, bool IsCausal>
