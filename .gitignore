@@ -8,3 +8,11 @@ build/
 dist/
 *.log
 .venv/
+
+# v9 outputs
+profile_output/
+test-output/
+bench_output/
+results/
+paper/build/
+*.ncu-rep
