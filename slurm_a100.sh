@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=v7-test
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:a100:1
+#SBATCH --partition=lowd ### gpu partition
+#SBATCH --gpus=1 ### 1 GPU
+#SBATCH --constraint=a100,gpu-80gb ### A100 80GB
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
@@ -53,9 +54,10 @@ echo "============================================================"
 
 # --- Environment setup ---
 # Uncomment/modify for your cluster:
-# module load cuda/12.1 pytorch/2.x
+module purge
+module load gcc/13.1.0 miniconda-t2/20230523 python3/3.11.4 cuda/12.4.1
 # source /path/to/your/venv/bin/activate
-# conda activate your_env
+conda activate mytorch
 
 echo ""
 echo "Python: $(python --version)"
