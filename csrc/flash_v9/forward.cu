@@ -21,12 +21,12 @@ __global__ void flash_v9_fwd_kernel(
     const Dtype* __restrict__ Q_ptr,  // [B, H, N, D]
     const Dtype* __restrict__ K_ptr,  // [B, H, N, D]
     const Dtype* __restrict__ V_ptr,  // [B, H, N, D]
-    Dtype*       __restrict__ /*O_ptr*/,
-    float*       __restrict__ /*L_ptr*/,
+    Dtype*       __restrict__ O_ptr,
+    float*       __restrict__ L_ptr,
     int B, int H, int N, int /*D*/,
     int64_t qkv_batch_stride, int64_t qkv_head_stride, int64_t /*qkv_row_stride*/,
-    int64_t /*o_batch_stride*/, int64_t /*o_head_stride*/, int64_t /*o_row_stride*/,
-    int64_t /*l_batch_stride*/, int64_t /*l_head_stride*/,
+    int64_t o_batch_stride,   int64_t o_head_stride,   int64_t /*o_row_stride*/,
+    int64_t l_batch_stride,   int64_t l_head_stride,
     float softmax_scale
 ) {
     constexpr int NumThreads = 128;
@@ -139,9 +139,92 @@ __global__ void flash_v9_fwd_kernel(
     softmax.template max_get_scale</*Is_first=*/true>(rS);
     softmax.template online_softmax</*Is_first=*/true>(rS);
 
-    // rS now holds P = exp2((Q.K^T) * softmax_scale_log2 - max_scaled).
-    // softmax.row_sum holds the per-row partial sum (no quad allreduce yet).
-    // 3e: convert rS to bf16, do P.V MMA, write O + L.
+    // ------------------------------------------------------------------------
+    // 3e: P . V MMA -> rO accumulator (fp32), finalize softmax, write O+L.
+    // ------------------------------------------------------------------------
+
+    // (1) Convert rS to A-operand layout for P.V MMA and cast fp32 -> bf16.
+    Tensor tOrP_acc = make_tensor(
+        rS.data(),
+        convert_layout_acc_Aregs<TiledMma_t>(rS.layout())
+    );
+    Tensor tOrP = make_tensor_like<Dtype>(tOrP_acc);
+    convert_type_out(tOrP_acc, tOrP);
+
+    // (2) Allocate rO fp32 accumulator for P.V output (Br x Headdim per warp-tuple).
+    auto rO = partition_fragment_C(tiled_mma, Shape<Int<Br>, Int<Headdim>>{});
+    clear(rO);
+
+    // (3) Smem->reg loads for V (operand B in P.V). The physical sV is
+    // (Bc, Headdim) row-major; the MMA's B operand wants (N=Headdim, K=Bc).
+    // sVt is the same bytes viewed as (Headdim, Bc); LDSM_T transpose-loads.
+    auto sVt = make_tensor(make_smem_ptr(sV_data),
+                           SmemLayoutVt<Bc, Headdim, Dtype>{});
+    using SmemCopyAtom_V = Copy_Atom<SM75_U16x8_LDSM_T, Dtype>;
+    auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtom_V{}, tiled_mma);
+    auto smem_thr_copy_V   = smem_tiled_copy_V.get_thread_slice(threadIdx.x);
+    auto rV = thr_mma.partition_fragment_B(sVt);
+    auto tOsV       = smem_thr_copy_V.partition_S(sVt);
+    auto tOrV_view  = smem_thr_copy_V.retile_D(rV);
+
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tOrP); ++k) {
+        copy(smem_tiled_copy_V, tOsV(_, _, k), tOrV_view(_, _, k));
+        gemm(tiled_mma, tOrP(_, _, k), rV(_, _, k), rO);
+    }
+
+    // (4) Finalize softmax: quad-allreduce row_sum, divide rO by sum, and
+    // overwrite softmax.row_sum with L = m + log(sum).
+    auto scores_scale = softmax.finalize(/*final_scale=*/1.0f);
+    softmax.rescale_o(rO, scores_scale);
+
+    // (5) Convert rO fp32 -> bf16/fp16.
+    Tensor rO_out = make_tensor_like<Dtype>(rO);
+    convert_type_out(rO, rO_out);
+
+    // (6) Store rO_out to smem (reuse sQ area; Q is no longer needed).
+    __syncthreads();
+    auto sO = make_tensor(make_smem_ptr(sQ_data), SmemQ_t{});
+    using SmemCopyAtom_O = Copy_Atom<DefaultCopy, Dtype>;
+    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtom_O{}, tiled_mma);
+    auto smem_thr_copy_O   = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
+    auto tOsO_dst    = smem_thr_copy_O.partition_D(sO);
+    auto tOrO_view   = smem_thr_copy_O.retile_S(rO_out);
+    copy(smem_tiled_copy_O, tOrO_view, tOsO_dst);
+    __syncthreads();
+
+    // (7) Store smem -> gmem with vectorized non-async copies.
+    Dtype* O_bh = O_ptr + b * o_batch_stride + h * o_head_stride;
+    auto gO_head = make_tensor(make_gmem_ptr(O_bh),
+                               make_shape(N, Int<Headdim>{}),
+                               make_stride(Int<Headdim>{}, _1{}));
+    auto gO_tiles = local_tile(gO_head, Shape<Int<Br>, Int<Headdim>>{},
+                               make_coord(_, _0{}));
+    auto gO = gO_tiles(_, _, q_block);
+
+    using GmemTiledCopyO_t =
+        typename GmemTiledCopyOTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
+    GmemTiledCopyO_t gmem_copy_o;
+    auto thr_copy_o = gmem_copy_o.get_thread_slice(threadIdx.x);
+    auto tOsO_src = thr_copy_o.partition_S(sO);
+    auto tOgO     = thr_copy_o.partition_D(gO);
+    copy(gmem_copy_o, tOsO_src, tOgO);
+
+    // (8) Write L. After finalize(), softmax.row_sum holds L = m + log(sum)
+    // per row, replicated across 4 lanes of each quad. Each thread owns 2
+    // rows (lane_id/4 and lane_id/4 + 8 within its warp). Lane (lane_id%4==0)
+    // is responsible for writing both rows of its quad.
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if ((lane_id & 3) == 0) {
+        int row_lo = warp_id * 16 + (lane_id >> 2);
+        int row_hi = row_lo + 8;
+        int q_row_lo = q_block * Br + row_lo;
+        int q_row_hi = q_block * Br + row_hi;
+        int64_t L_base = b * l_batch_stride + h * l_head_stride;
+        if (q_row_lo < N) L_ptr[L_base + q_row_lo] = softmax.row_sum(0);
+        if (q_row_hi < N) L_ptr[L_base + q_row_hi] = softmax.row_sum(1);
+    }
 }
 
 template <typename Dtype, int Headdim, bool IsCausal>
@@ -235,19 +318,14 @@ std::vector<torch::Tensor> flash_v9_forward_cuda(
     auto O = torch::empty_like(Q);
     auto L = torch::empty({B, H, N}, Q.options().dtype(torch::kFloat32));
 
-    // Until commit 3e fills in the kernel, fill outputs with zeros so the
-    // wrapper still produces well-defined tensors.
-    O.zero_();
-    L.zero_();
-
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (Q.scalar_type() == torch::kBFloat16) {
-        flash_v9::dispatch_fwd_headdim<__nv_bfloat16>(
-            reinterpret_cast<const __nv_bfloat16*>(Q.data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(K.data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(V.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(O.data_ptr()),
+        flash_v9::dispatch_fwd_headdim<cutlass::bfloat16_t>(
+            reinterpret_cast<const cutlass::bfloat16_t*>(Q.data_ptr()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(K.data_ptr()),
+            reinterpret_cast<const cutlass::bfloat16_t*>(V.data_ptr()),
+            reinterpret_cast<cutlass::bfloat16_t*>(O.data_ptr()),
             L.data_ptr<float>(),
             (int)B, (int)H, (int)N, (int)D,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -256,11 +334,11 @@ std::vector<torch::Tensor> flash_v9_forward_cuda(
             is_causal, (float)softmax_scale, stream
         );
     } else if (Q.scalar_type() == torch::kHalf) {
-        flash_v9::dispatch_fwd_headdim<__half>(
-            reinterpret_cast<const __half*>(Q.data_ptr()),
-            reinterpret_cast<const __half*>(K.data_ptr()),
-            reinterpret_cast<const __half*>(V.data_ptr()),
-            reinterpret_cast<__half*>(O.data_ptr()),
+        flash_v9::dispatch_fwd_headdim<cutlass::half_t>(
+            reinterpret_cast<const cutlass::half_t*>(Q.data_ptr()),
+            reinterpret_cast<const cutlass::half_t*>(K.data_ptr()),
+            reinterpret_cast<const cutlass::half_t*>(V.data_ptr()),
+            reinterpret_cast<cutlass::half_t*>(O.data_ptr()),
             L.data_ptr<float>(),
             (int)B, (int)H, (int)N, (int)D,
             Q.stride(0), Q.stride(1), Q.stride(2),

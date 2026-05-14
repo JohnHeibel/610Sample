@@ -12,6 +12,8 @@
 #include <cute/atom/mma_atom.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass/array.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -86,6 +88,19 @@ using SmemLayoutK = decltype(cute::tile_to_shape(
 template <int Bc, int Headdim, typename Element>
 using SmemLayoutV = SmemLayoutK<Bc, Headdim, Element>;
 
+// SmemLayoutVt: transposed view of sV for the P.V MMA's B operand. The
+// physical bytes stay where the cp.async wrote them (row-major (Bc, Headdim))
+// but we view them as (Headdim, Bc) so partition_fragment_B sees the right
+// (N=Headdim, K=Bc) shape and SM75_U16x8_LDSM_T can transpose-load.
+template <int Bc, int Headdim, typename Element>
+using SmemLayoutVt = decltype(cute::composition(
+    SmemLayoutV<Bc, Headdim, Element>{},
+    cute::make_ordered_layout(
+        cute::make_shape(cute::Int<Headdim>{}, cute::Int<Bc>{}),
+        cute::Step<cute::_2, cute::_1>{}
+    )
+));
+
 // ----------------------------------------------------------------------------
 // Gmem TiledCopy descriptor: SM80 cp.async with int4 (16B = 8 bf16) vectors.
 // Layout-of-threads is chosen so each row of the smem atom is loaded by a
@@ -122,7 +137,7 @@ struct GmemTiledCopyTraits {
 template <typename Element>
 using MmaAtom_SM80 = cute::MMA_Atom<
     std::conditional_t<
-        std::is_same_v<Element, __half>,
+        std::is_same_v<Element, cutlass::half_t>,
         cute::SM80_16x8x16_F32F16F16F32_TN,
         cute::SM80_16x8x16_F32BF16BF16F32_TN
     >
@@ -136,8 +151,31 @@ using TiledMma_SM80 = cute::TiledMMA<
 >;
 
 // ----------------------------------------------------------------------------
-// Smem usage in bytes for one Q tile + one K tile + one V tile.
-// Used by the kernel launcher to allocate dynamic shared memory.
+// Gmem TiledCopy for the output store (smem -> gmem). cp.async is gmem->smem
+// only, so we use a regular vectorized store atom on the way out.
+// ----------------------------------------------------------------------------
+template <int Headdim, int NumThreads, typename Element>
+struct GmemTiledCopyOTraits {
+    using Traits = GmemCopyTraits<Headdim, Element>;
+    static constexpr int kGmemThreadsPerRow = Traits::kBlockKGmem / Traits::kElemsPerLoad;
+    using GmemLayoutAtom = cute::Layout<
+        cute::Shape <cute::Int<NumThreads / kGmemThreadsPerRow>, cute::Int<kGmemThreadsPerRow>>,
+        cute::Stride<cute::Int<kGmemThreadsPerRow>,              cute::_1>
+    >;
+    using GmemCopyAtom = cute::Copy_Atom<
+        cute::AutoVectorizingCopyWithAssumedAlignment<128>,
+        Element
+    >;
+    using GmemTiledCopy = decltype(cute::make_tiled_copy(
+        GmemCopyAtom{},
+        GmemLayoutAtom{},
+        cute::Layout<cute::Shape<cute::_1, cute::Int<Traits::kElemsPerLoad>>>{}
+    ));
+};
+
+// ----------------------------------------------------------------------------
+// Smem usage in bytes for Q + K + V. sO reuses the sQ region for the
+// output epilogue (Q is no longer needed by the time we store O).
 // ----------------------------------------------------------------------------
 template <int Br, int Bc, int Headdim, typename Element>
 struct SmemSize {
@@ -194,6 +232,46 @@ CUTE_DEVICE auto convert_layout_acc_rowcol(Layout acc_layout) {
     auto l = logical_divide(acc_layout, Shape<_2>{});
     return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
                        make_layout(get<0, 0>(l), get<2>(l)));
+}
+
+// SM80 m16n8k16: convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N/2)
+// so the fp32 accumulator can be re-interpreted as an A-operand fragment for
+// the next MMA (P.V).
+template <typename TiledMma, typename Layout>
+CUTE_DEVICE auto convert_layout_acc_Aregs(Layout acc_layout) {
+    using namespace cute;
+    using X = Underscore;
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    constexpr int mma_shape_K = get<2>(typename TiledMma::Shape_MNK{});
+    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+    if constexpr (mma_shape_K == 8) {
+        return acc_layout;
+    } else {
+        auto l = logical_divide(acc_layout, Shape<X, X, _2>{});
+        return make_layout(make_layout(get<0>(l), get<2, 0>(l)),
+                           get<1>(l),
+                           get<2, 1>(l));
+    }
+}
+
+// fp32 -> bf16/fp16 in-register conversion using cutlass::NumericArrayConverter
+// for proper vectorized PTX (cvt.bf16x2.f32x2 etc.).
+template <typename Engine, typename Layout, typename EngineOut>
+CUTE_DEVICE void convert_type_out(cute::Tensor<Engine, Layout> const& tensor,
+                                  cute::Tensor<EngineOut, Layout>& out) {
+    using namespace cute;
+    using From = typename Engine::value_type;
+    using To   = typename EngineOut::value_type;
+    static constexpr int FragmentSize =
+        std::max(sizeof(From) / sizeof(To), sizeof(To) / sizeof(From));
+    static_assert(CUTE_STATIC_V(size(tensor)) % FragmentSize == 0,
+                  "Fragment size does not vectorize properly");
+    Tensor frag    = recast<cutlass::Array<From, FragmentSize> const>(tensor);
+    Tensor out_frg = recast<cutlass::Array<To,   FragmentSize>>(out);
+    cutlass::NumericArrayConverter<To, From, FragmentSize> op;
+    CUTE_UNROLL
+    for (int i = 0; i < size(frag); ++i) { out_frg[i] = op(frag[i]); }
 }
 
 // Per-thread reduction over a 2D (rows, cols) view: reduce along the col
