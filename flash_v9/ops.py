@@ -6,6 +6,14 @@ compose cleanly:
 
     FlashV9Function       calls backward in its .backward
         -> FlashV9Backward calls double_backward in its .backward
+
+Status:
+- forward       CUDA (CUTLASS / CuTe).    Functionally complete.
+- backward      Python reference (torch). Correct but slow. CUDA replacement
+                planned post-dbl_bwd. The Python implementation uses the
+                saved L (not Q.K^T from scratch), so memory cost stays O(N^2)
+                only inside this function -- not in the autograd graph.
+- double_bwd    CUDA (CUTLASS / CuTe).    The novel IO-aware piece.
 """
 
 import math
@@ -13,10 +21,39 @@ import torch
 import flash_v9_cuda as _ext
 
 
+def _reference_bwd(dO, Q, K, V, O, L, is_causal, softmax_scale):
+    """Python reference for v9 backward.
+
+    Uses the saved L = m + log(sum_exp(S - m)) so we can recover
+    P = exp(S * scale - L) without recomputing the rowmax.
+
+    Returns (dQ, dK, dV) in the input dtype.
+    """
+    Qf, Kf, Vf, Of, dOf = Q.float(), K.float(), V.float(), O.float(), dO.float()
+    S = torch.matmul(Qf, Kf.transpose(-2, -1)) * softmax_scale  # [B,H,N,N]
+    if is_causal:
+        N_q = Q.shape[-2]
+        N_kv = K.shape[-2]
+        q_idx = torch.arange(N_q, device=Q.device).unsqueeze(1)
+        k_idx = torch.arange(N_kv, device=Q.device).unsqueeze(0)
+        mask = q_idx + (N_kv - N_q) >= k_idx
+        S = S.masked_fill(~mask, float('-inf'))
+    P = torch.exp(S - L.unsqueeze(-1))                          # [B,H,N,N]
+    P = torch.nan_to_num(P, nan=0.0)
+    dV = torch.matmul(P.transpose(-2, -1), dOf)
+    dP = torch.matmul(dOf, Vf.transpose(-2, -1))
+    Di = (dOf * Of).sum(dim=-1, keepdim=True)
+    dS = P * (dP - Di) * softmax_scale
+    dQ = torch.matmul(dS, Kf)
+    dK = torch.matmul(dS.transpose(-2, -1), Qf)
+    return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype)
+
+
 class FlashV9Backward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, dO, Q, K, V, O, L, is_causal, softmax_scale):
-        dQ, dK, dV = _ext.backward(dO, Q, K, V, O, L, is_causal, softmax_scale)
+        with torch.no_grad():
+            dQ, dK, dV = _reference_bwd(dO, Q, K, V, O, L, is_causal, softmax_scale)
         ctx.save_for_backward(dO, Q, K, V, O, L)
         ctx.is_causal = is_causal
         ctx.softmax_scale = softmax_scale
