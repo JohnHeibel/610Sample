@@ -9,52 +9,97 @@
 
 namespace flash_v9 {
 
+using namespace cute;
+
 // -----------------------------------------------------------------------------
-// Kernel launch skeleton for Algorithm 1 (forward).
-//
-// Templated on dtype, head dim, tile sizes (Br, Bc), and is_causal so the
-// compiler can specialize layouts, smem usage, and mask logic. The body is
-// empty in commit 3a; subsequent commits fill in:
-//   3b: cp.async gmem -> smem copies for Q, K, V tiles
-//   3c: Q.K^T MMA via CuTe atoms (S = Q K^T)
-//   3d: online softmax (running m, l; rescale O)
-//   3e: P.V MMA, write output
-//   3f: multi-tile inner loop
-//   3g: causal masking variant
-//   3h: tuning (occupancy, smem budget, cp.async stages)
+// Forward kernel (Algorithm 1).
+// Sub-commit 3b: gmem -> smem cp.async copies for Q, K, V tiles (first K/V
+// tile only). No compute. Output O and L remain zero (set by host).
 // -----------------------------------------------------------------------------
 template <typename Dtype, int Headdim, int Br, int Bc, bool IsCausal>
 __global__ void flash_v9_fwd_kernel(
-    const Dtype* __restrict__ Q,  // [B, H, N, D]
-    const Dtype* __restrict__ K,  // [B, H, N, D]
-    const Dtype* __restrict__ V,  // [B, H, N, D]
-    Dtype*       __restrict__ O,  // [B, H, N, D]
-    float*       __restrict__ L,  // [B, H, N]   (logsumexp)
+    const Dtype* __restrict__ Q_ptr,  // [B, H, N, D]
+    const Dtype* __restrict__ K_ptr,  // [B, H, N, D]
+    const Dtype* __restrict__ V_ptr,  // [B, H, N, D]
+    Dtype*       __restrict__ /*O_ptr*/,
+    float*       __restrict__ /*L_ptr*/,
     int B, int H, int N, int /*D*/,
-    int64_t qkv_batch_stride, int64_t qkv_head_stride, int64_t qkv_row_stride,
-    int64_t o_batch_stride,   int64_t o_head_stride,   int64_t o_row_stride,
-    int64_t l_batch_stride,   int64_t l_head_stride,
-    float softmax_scale
+    int64_t qkv_batch_stride, int64_t qkv_head_stride, int64_t /*qkv_row_stride*/,
+    int64_t /*o_batch_stride*/, int64_t /*o_head_stride*/, int64_t /*o_row_stride*/,
+    int64_t /*l_batch_stride*/, int64_t /*l_head_stride*/,
+    float /*softmax_scale*/
 ) {
-    // Block geometry: gridDim.x indexes the query-row tile, gridDim.y the
-    // (batch, head) pair. This matches FA2's launch convention.
-    //
-    // Currently a no-op. The .cu file compiles, links into flash_v9_cuda,
-    // and the launch in flash_v9_forward_cuda produces well-formed outputs
-    // (O and L are still allocated as zeros at host side until commit 3e).
-    (void)Q; (void)K; (void)V; (void)O; (void)L;
-    (void)B; (void)H; (void)N;
-    (void)qkv_batch_stride; (void)qkv_head_stride; (void)qkv_row_stride;
-    (void)o_batch_stride;   (void)o_head_stride;   (void)o_row_stride;
-    (void)l_batch_stride;   (void)l_head_stride;
-    (void)softmax_scale;
+    constexpr int NumThreads = 128;
+    using SmemQ_t = SmemLayoutQ<Br, Headdim, Dtype>;
+    using SmemK_t = SmemLayoutK<Bc, Headdim, Dtype>;
+    using SmemV_t = SmemLayoutV<Bc, Headdim, Dtype>;
+    using GmemCopy_t =
+        typename GmemTiledCopyTraits<Headdim, NumThreads, Dtype>::GmemTiledCopy;
+
+    extern __shared__ char smem_buf[];
+    Dtype* sQ_data = reinterpret_cast<Dtype*>(smem_buf);
+    Dtype* sK_data = sQ_data + cosize_v<SmemQ_t>;
+    Dtype* sV_data = sK_data + cosize_v<SmemK_t>;
+
+    auto sQ = make_tensor(make_smem_ptr(sQ_data), SmemQ_t{});
+    auto sK = make_tensor(make_smem_ptr(sK_data), SmemK_t{});
+    auto sV = make_tensor(make_smem_ptr(sV_data), SmemV_t{});
+
+    const int bh      = blockIdx.y;
+    const int b       = bh / H;
+    const int h       = bh % H;
+    const int q_block = blockIdx.x;
+
+    const Dtype* Q_bh = Q_ptr + b * qkv_batch_stride + h * qkv_head_stride;
+    const Dtype* K_bh = K_ptr + b * qkv_batch_stride + h * qkv_head_stride;
+    const Dtype* V_bh = V_ptr + b * qkv_batch_stride + h * qkv_head_stride;
+
+    auto gQ_head = make_tensor(make_gmem_ptr(Q_bh),
+                               make_shape(N, Int<Headdim>{}),
+                               make_stride(Int<Headdim>{}, _1{}));
+    auto gK_head = make_tensor(make_gmem_ptr(K_bh),
+                               make_shape(N, Int<Headdim>{}),
+                               make_stride(Int<Headdim>{}, _1{}));
+    auto gV_head = make_tensor(make_gmem_ptr(V_bh),
+                               make_shape(N, Int<Headdim>{}),
+                               make_stride(Int<Headdim>{}, _1{}));
+
+    // Tile the head slice into (Br, Headdim) Q blocks and (Bc, Headdim) K/V
+    // blocks. For 3b we load only the first K/V tile.
+    auto gQ_tiles = local_tile(gQ_head, Shape<Int<Br>, Int<Headdim>>{},
+                               make_coord(_, _0{}));
+    auto gK_tiles = local_tile(gK_head, Shape<Int<Bc>, Int<Headdim>>{},
+                               make_coord(_, _0{}));
+    auto gV_tiles = local_tile(gV_head, Shape<Int<Bc>, Int<Headdim>>{},
+                               make_coord(_, _0{}));
+
+    auto gQ = gQ_tiles(_, _, q_block);  // (Br, Headdim)
+    auto gK = gK_tiles(_, _, 0);        // (Bc, Headdim)
+    auto gV = gV_tiles(_, _, 0);        // (Bc, Headdim)
+
+    GmemCopy_t gmem_copy_qkv;
+    auto thr_copy = gmem_copy_qkv.get_thread_slice(threadIdx.x);
+
+    auto tQgQ = thr_copy.partition_S(gQ);
+    auto tQsQ = thr_copy.partition_D(sQ);
+    copy(gmem_copy_qkv, tQgQ, tQsQ);
+
+    auto tKgK = thr_copy.partition_S(gK);
+    auto tKsK = thr_copy.partition_D(sK);
+    copy(gmem_copy_qkv, tKgK, tKsK);
+
+    auto tVgV = thr_copy.partition_S(gV);
+    auto tVsV = thr_copy.partition_D(sV);
+    copy(gmem_copy_qkv, tVgV, tVsV);
+
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
+
+    // 3b: compute is intentionally absent. Smem now holds Q, K, V tiles;
+    // 3c will introduce the Q.K^T MMA.
 }
 
-// -----------------------------------------------------------------------------
-// Dispatch table: dtype x headdim x is_causal.
-// Tile sizes (Br, Bc) are picked per headdim. Initial values match FA2's
-// defaults for sm_80 and will be retuned in commit 3h.
-// -----------------------------------------------------------------------------
 template <typename Dtype, int Headdim, bool IsCausal>
 static void launch_fwd(
     const Dtype* Q, const Dtype* K, const Dtype* V,
@@ -63,21 +108,21 @@ static void launch_fwd(
     int64_t qkv_batch_stride, int64_t qkv_head_stride, int64_t qkv_row_stride,
     int64_t o_batch_stride,   int64_t o_head_stride,   int64_t o_row_stride,
     int64_t l_batch_stride,   int64_t l_head_stride,
-    float softmax_scale,
-    cudaStream_t stream
+    float softmax_scale, cudaStream_t stream
 ) {
     constexpr int Br = 64;
-    constexpr int Bc = (Headdim <= 64) ? 64 : 64;  // retuned in 3h
-    constexpr int kNumThreads = 128;               // 4 warps; retuned in 3h
+    constexpr int Bc = 64;
+    constexpr int kNumThreads = 128;
+
+    constexpr int smem_bytes = SmemSize<Br, Bc, Headdim, Dtype>::total_bytes;
 
     const int num_q_blocks = (N + Br - 1) / Br;
     dim3 grid(num_q_blocks, B * H);
     dim3 block(kNumThreads);
 
     flash_v9_fwd_kernel<Dtype, Headdim, Br, Bc, IsCausal>
-        <<<grid, block, /*smem=*/0, stream>>>(
-            Q, K, V, O, L,
-            B, H, N, D,
+        <<<grid, block, smem_bytes, stream>>>(
+            Q, K, V, O, L, B, H, N, D,
             qkv_batch_stride, qkv_head_stride, qkv_row_stride,
             o_batch_stride,   o_head_stride,   o_row_stride,
             l_batch_stride,   l_head_stride,
